@@ -442,7 +442,7 @@ impl SetInfo {
         const NFGENMSG_LEN: usize = 4;
         const NLA_HEADER_LEN: usize = 4;
         const NLA_TYPE_MASK: u16 = 0x3fff;
-        const NFTA_SET_COUNT: u16 = 19;
+        const NFTA_SET_COUNT: u16 = 20;
         let len = message.nlmsg_len as usize;
         if len < size_of::<libc::nlmsghdr>() + NFGENMSG_LEN {
             return None;
@@ -1332,13 +1332,17 @@ mod tests {
 
     #[test]
     fn set_count_parses_valid_and_missing_attributes() {
-        let count = synthetic_message(&[(7, b"ignored"), (19, &4_228_762u32.to_be_bytes())]);
+        let count = synthetic_message(&[
+            (7, b"ignored"),
+            (19, b"rbtree\0"),
+            (20, &4_228_762u32.to_be_bytes()),
+        ]);
         assert_eq!(SetInfo::count(header(count.as_bytes())), Some(4_228_762));
 
-        let missing = synthetic_message(&[(7, b"ignored")]);
+        let missing = synthetic_message(&[(7, b"ignored"), (19, b"rbtree\0")]);
         assert_eq!(SetInfo::count(header(missing.as_bytes())), None);
 
-        let short_count = synthetic_message(&[(19, &[0, 1, 2])]);
+        let short_count = synthetic_message(&[(20, &[0, 1, 2])]);
         assert_eq!(SetInfo::count(header(short_count.as_bytes())), None);
     }
 
@@ -1350,12 +1354,12 @@ mod tests {
         set_message_len(&mut too_short, size_of::<libc::nlmsghdr>());
         assert_eq!(SetInfo::count(header(too_short.as_bytes())), None);
 
-        let mut undersized = synthetic_message(&[(19, &1u32.to_be_bytes())]);
+        let mut undersized = synthetic_message(&[(20, &1u32.to_be_bytes())]);
         undersized.buffer.as_bytes_mut()[ATTRIBUTE_OFFSET..ATTRIBUTE_OFFSET + 2]
             .copy_from_slice(&3u16.to_ne_bytes());
         assert_eq!(SetInfo::count(header(undersized.as_bytes())), None);
 
-        let mut truncated = synthetic_message(&[(19, &1u32.to_be_bytes())]);
+        let mut truncated = synthetic_message(&[(20, &1u32.to_be_bytes())]);
         truncated.buffer.as_bytes_mut()[ATTRIBUTE_OFFSET..ATTRIBUTE_OFFSET + 2]
             .copy_from_slice(&12u16.to_ne_bytes());
         assert_eq!(SetInfo::count(header(truncated.as_bytes())), None);
