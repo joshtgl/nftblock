@@ -1,0 +1,8 @@
+{
+  "WAN": ["eth0"],
+  "LOCAL": { "interfaces": [], "local": true },
+  "LAN": ["eth1"],
+  "GUEST": ["eth2"],
+  "VPN1": ["wg0"],
+  "VPN2": ["wg1"]
+}

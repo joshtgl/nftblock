@@ -1,0 +1,142 @@
+#!/bin/sh
+set -eu
+
+if [ "$(id -u)" -ne 0 ]; then
+    echo "tests/netns.sh must run as root" >&2
+    exit 77
+fi
+
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+BIN=${NFTBLOCK_BIN:-$ROOT/target/debug/nftblock}
+TMP=$(mktemp -d /tmp/nftblock-netns.XXXXXX)
+ROUTER="nftblock-router-$$"
+WAN="nftblock-wan-$$"
+LAN="nftblock-lan-$$"
+PID=""
+cleanup() {
+    if [ -n "$PID" ]; then kill -TERM "$PID" 2>/dev/null || true; wait "$PID" 2>/dev/null || true; fi
+    ip netns del "$ROUTER" 2>/dev/null || true
+    ip netns del "$WAN" 2>/dev/null || true
+    ip netns del "$LAN" 2>/dev/null || true
+    rm -rf -- "$TMP"
+}
+trap cleanup EXIT INT TERM
+
+cd "$ROOT"
+if [ -z "${NFTBLOCK_BIN:-}" ]; then cargo build --locked; fi
+ip netns add "$ROUTER"
+ip netns add "$WAN"
+ip netns add "$LAN"
+ip link add nb-wan type veth peer name wan0
+ip link add nb-lan type veth peer name lan0
+ip link set wan0 netns "$ROUTER"
+ip link set nb-wan netns "$WAN"
+ip link set lan0 netns "$ROUTER"
+ip link set nb-lan netns "$LAN"
+
+ip -n "$ROUTER" addr add 192.0.2.1/24 dev wan0
+ip -n "$ROUTER" addr add 198.51.100.1/24 dev wan0
+ip -n "$ROUTER" addr add 10.0.0.1/24 dev lan0
+ip -n "$WAN" addr add 192.0.2.2/24 dev nb-wan
+ip -n "$WAN" addr add 198.51.100.2/24 dev nb-wan
+ip -n "$LAN" addr add 10.0.0.2/24 dev nb-lan
+for spec in "$ROUTER wan0" "$ROUTER lan0" "$WAN nb-wan" "$LAN nb-lan"; do
+    set -- $spec
+    ip -n "$1" link set "$2" up
+done
+ip netns exec "$ROUTER" sysctl -q -w net.ipv4.ip_forward=1
+ip -n "$WAN" route add 10.0.0.0/24 via 192.0.2.1
+ip -n "$LAN" route add 192.0.2.0/24 via 10.0.0.1
+ip -n "$LAN" route add 198.51.100.0/24 via 10.0.0.1
+
+# Prove the namespace topology before installing any filtering rules.
+ip netns exec "$WAN" ping -c 1 -W 1 192.0.2.1 >/dev/null
+ip netns exec "$WAN" ping -c 1 -W 1 10.0.0.2 >/dev/null
+ip netns exec "$ROUTER" ping -c 1 -W 1 198.51.100.2 >/dev/null
+ip netns exec "$LAN" ping -c 1 -W 1 198.51.100.2 >/dev/null
+
+cat >"$TMP/zones.json" <<'EOF'
+{"WAN":["wan0"],"LAN":["lan0"]}
+EOF
+cat >"$TMP/inbound.txt" <<'EOF'
+# generated
+192.0.2.2/32
+2001:db8:1::/48
+EOF
+cat >"$TMP/outbound.txt" <<'EOF'
+# generated
+198.51.100.2/32
+2001:db8:2::/48
+EOF
+cat >"$TMP/nftblock.toml" <<EOF
+[files]
+zones = "$TMP/zones.json"
+inbound = "$TMP/inbound.txt"
+outbound = "$TMP/outbound.txt"
+[nftables]
+allow_flowtable_bypass = false
+[[rules.input]]
+blocklist = "inbound"
+ingress_zones = ["WAN"]
+[[rules.forward]]
+blocklist = "inbound"
+ingress_zones = ["WAN"]
+egress_zones = ["LAN"]
+[[rules.output]]
+blocklist = "outbound"
+egress_zones = ["WAN"]
+[[rules.forward]]
+blocklist = "outbound"
+ingress_zones = ["LAN"]
+egress_zones = ["WAN"]
+EOF
+
+ip netns exec "$ROUTER" "$BIN" --config "$TMP/nftblock.toml" >"$TMP/log" 2>&1 &
+PID=$!
+tries=0
+until ip netns exec "$ROUTER" nft list table inet nftblock >"$TMP/ruleset" 2>/dev/null; do
+    tries=$((tries + 1))
+    if [ "$tries" -gt 50 ]; then cat "$TMP/log" >&2; exit 1; fi
+    sleep 0.1
+done
+
+# Input inbound: source 192.0.2.2 arriving on WAN.
+if ip netns exec "$WAN" ping -c 1 -W 1 192.0.2.1 >/dev/null 2>&1; then exit 1; fi
+# Forward inbound: source 192.0.2.2 from WAN to LAN.
+if ip netns exec "$WAN" ping -c 1 -W 1 10.0.0.2 >/dev/null 2>&1; then exit 1; fi
+# Output outbound: destination 198.51.100.2 leaving WAN.
+if ip netns exec "$ROUTER" ping -c 1 -W 1 198.51.100.2 >/dev/null 2>&1; then exit 1; fi
+# Forward outbound: LAN to destination 198.51.100.2 on WAN.
+if ip netns exec "$LAN" ping -c 1 -W 1 198.51.100.2 >/dev/null 2>&1; then exit 1; fi
+
+# An invalid atomic replacement must retain the active inbound set.
+printf '%s\n' 'not-a-cidr' >"$TMP/.inbound.tmp"
+mv "$TMP/.inbound.tmp" "$TMP/inbound.txt"
+sleep 1
+if ip netns exec "$WAN" ping -c 1 -W 1 192.0.2.1 >/dev/null 2>&1; then exit 1; fi
+
+# A valid rename reloads inbound independently; outbound must remain blocked.
+printf '%s\n' '203.0.113.0/24' >"$TMP/.inbound.tmp"
+mv "$TMP/.inbound.tmp" "$TMP/inbound.txt"
+tries=0
+until ip netns exec "$WAN" ping -c 1 -W 1 192.0.2.1 >/dev/null 2>&1; do
+    tries=$((tries + 1))
+    if [ "$tries" -gt 30 ]; then cat "$TMP/log" >&2; exit 1; fi
+    sleep 0.1
+done
+if ip netns exec "$ROUTER" ping -c 1 -W 1 198.51.100.2 >/dev/null 2>&1; then exit 1; fi
+
+kill -TERM "$PID"
+wait "$PID"
+PID=""
+ip netns exec "$ROUTER" nft list table inet nftblock >/dev/null
+
+# A protected flowtable must make startup fail closed.
+ip netns exec "$ROUTER" nft add table inet flowtest
+ip netns exec "$ROUTER" nft 'add flowtable inet flowtest fast { hook ingress priority 0; devices = { wan0 }; }'
+if ip netns exec "$ROUTER" "$BIN" --config "$TMP/nftblock.toml" >"$TMP/flowtable-log" 2>&1; then
+    echo "daemon accepted a flowtable on protected wan0" >&2
+    exit 1
+fi
+grep -q 'flowtable offload uses protected interface' "$TMP/flowtable-log"
+echo "native input/forward/output enforcement verified"

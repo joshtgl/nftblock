@@ -1,0 +1,25 @@
+# syntax=docker/dockerfile:1
+
+FROM rust:1.94-trixie AS builder
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libmnl-dev libnftnl-dev pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+
+RUN cargo build --locked --release --bin nftblock
+
+FROM debian:trixie-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates libmnl0 libnftnl11 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /src/target/release/nftblock /usr/local/bin/nftblock
+COPY config/nftblock.toml /etc/nftblock/nftblock.toml
+
+ENTRYPOINT ["nftblock"]

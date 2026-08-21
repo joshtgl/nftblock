@@ -1,0 +1,39 @@
+[files]
+inbound = "/data/inbound.txt"
+outbound = "/data/outbound.txt"
+
+[zones]
+WAN = ["eth0"]
+LOCAL = { interfaces = [], local = true }
+LAN = ["eth1"]
+GUEST = ["eth2"]
+VPN1 = ["wg0"]
+VPN2 = ["wg1"]
+
+[nftables]
+table = "nftblock"
+priority = -5
+batch_page_bytes = 262144
+allow_flowtable_bypass = false
+
+[runtime]
+debounce_ms = 500
+reconcile_secs = 60
+
+[[rules.input]]
+blocklist = "inbound"
+ingress_zones = ["WAN"]
+
+[[rules.forward]]
+blocklist = "inbound"
+ingress_zones = ["WAN"]
+egress_zones = ["LAN", "GUEST"]
+
+[[rules.output]]
+blocklist = "outbound"
+egress_zones = ["WAN"]
+
+[[rules.forward]]
+blocklist = "outbound"
+ingress_zones = ["LAN", "GUEST", "VPN1", "VPN2"]
+egress_zones = ["WAN"]

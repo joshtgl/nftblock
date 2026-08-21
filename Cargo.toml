@@ -1,0 +1,41 @@
+[package]
+name = "nftblock"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Atomically apply CIDR lists with nftables netlink batches"
+
+[features]
+default = ["native-netlink"]
+native-netlink = ["dep:nftnl", "dep:mnl"]
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive", "env"] }
+env_logger = "0.11"
+ipnet = { version = "2.11", features = ["serde"] }
+log = "0.4"
+notify = "8.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+signal-hook = "0.3"
+thiserror = "2.0"
+toml = "0.9"
+nftnl = { version = "0.9", optional = true, features = ["nftnl-1-1-6"] }
+mnl = { version = "0.3", optional = true }
+
+[dev-dependencies]
+tempfile = "3.20"
+
+[lints.rust]
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
+multiple_unsafe_ops_per_block = "deny"
+
+[profile.release]
+lto = true
+strip = true
+codegen-units = 1
