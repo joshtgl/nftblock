@@ -865,6 +865,8 @@ pub mod test_backend {
         pub active: Option<ActiveGenerations>,
         pub fail_next: bool,
         pub generation: u64,
+        pub health: Option<Health>,
+        pub repairs: usize,
     }
     impl Backend for MemoryBackend {
         fn layout_status(&mut self, _: &Config) -> Result<LayoutStatus, BackendError> {
@@ -940,7 +942,7 @@ pub mod test_backend {
             Ok(())
         }
         fn health(&mut self, _: &Config, _: &ActiveGenerations) -> Result<Health, BackendError> {
-            Ok(Health::Healthy)
+            Ok(self.health.unwrap_or(Health::Healthy))
         }
         fn repair_rules(
             &mut self,
@@ -948,6 +950,7 @@ pub mod test_backend {
             _: &[RenderedRule],
             _: &ActiveGenerations,
         ) -> Result<(), BackendError> {
+            self.repairs += 1;
             Ok(())
         }
         fn flowtable_conflicts(
