@@ -30,6 +30,8 @@ impl AddressInterval {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct StreamStats {
     pub cidrs: u64,
+    pub ipv4_intervals: u64,
+    pub ipv6_intervals: u64,
     pub ipv4_boundaries: u64,
     pub ipv6_boundaries: u64,
 }
@@ -88,8 +90,14 @@ fn flush_pending(
     chunk.push(interval);
     *chunk_boundaries += elements;
     match interval {
-        AddressInterval::V4 { .. } => stats.ipv4_boundaries += elements as u64,
-        AddressInterval::V6 { .. } => stats.ipv6_boundaries += elements as u64,
+        AddressInterval::V4 { .. } => {
+            stats.ipv4_intervals += 1;
+            stats.ipv4_boundaries += elements as u64;
+        }
+        AddressInterval::V6 { .. } => {
+            stats.ipv6_intervals += 1;
+            stats.ipv6_boundaries += elements as u64;
+        }
     }
     if *chunk_boundaries >= limit {
         emit(chunk)?;
@@ -279,6 +287,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(stats.cidrs, 3);
+        assert_eq!(stats.ipv4_intervals, 1);
+        assert_eq!(stats.ipv6_intervals, 1);
         assert_eq!(chunks.len(), 2);
         assert_eq!(
             chunks[0],
@@ -318,6 +328,7 @@ mod tests {
     #[test]
     fn handles_address_space_end_with_one_boundary() {
         let (chunks, stats) = parse("255.255.255.255/32\n", 1).unwrap();
+        assert_eq!(stats.ipv4_intervals, 1);
         assert_eq!(stats.ipv4_boundaries, 1);
         assert_eq!(chunks[0][0].boundary_elements(), 1);
     }

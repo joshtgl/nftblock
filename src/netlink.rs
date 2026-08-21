@@ -17,6 +17,8 @@ pub struct DirectionGeneration {
     pub direction: Direction,
     pub ipv4_set: String,
     pub ipv6_set: String,
+    pub ipv4_intervals: u64,
+    pub ipv6_intervals: u64,
     pub ipv4_boundaries: u64,
     pub ipv6_boundaries: u64,
 }
@@ -105,6 +107,8 @@ pub trait Backend {
 }
 
 pub fn apply_stats(stage: &mut DirectionGeneration, stats: StreamStats) {
+    stage.ipv4_intervals = stats.ipv4_intervals;
+    stage.ipv6_intervals = stats.ipv6_intervals;
     stage.ipv4_boundaries = stats.ipv4_boundaries;
     stage.ipv6_boundaries = stats.ipv6_boundaries;
 }
@@ -210,10 +214,14 @@ mod native {
 
     pub struct NftnlBackend {
         next_generation: u64,
+        warned_missing_counts: bool,
     }
     impl NftnlBackend {
         pub fn new() -> Self {
-            Self { next_generation: 1 }
+            Self {
+                next_generation: 1,
+                warned_missing_counts: false,
+            }
         }
     }
     impl Default for NftnlBackend {
@@ -284,6 +292,8 @@ mod native {
                 direction,
                 ipv4_set,
                 ipv6_set,
+                ipv4_intervals: 0,
+                ipv6_intervals: 0,
                 ipv4_boundaries: 0,
                 ipv6_boundaries: 0,
             })
@@ -393,15 +403,49 @@ mod native {
         ) -> Result<Health, BackendError> {
             let sets = set_inventory(&config.nftables.table)?;
             if !sets.contains_key(LAYOUT_MARKER) {
+                log::warn!(
+                    "nftables layout verification failed: table=inet {} marker_set={} expected=present actual=absent",
+                    config.nftables.table,
+                    LAYOUT_MARKER
+                );
                 return Ok(Health::LayoutDamaged);
             }
-            let damaged = |value: &DirectionGeneration| {
-                sets.get(&value.ipv4_set).copied().flatten().map(u64::from)
-                    != Some(value.ipv4_boundaries)
-                    || sets.get(&value.ipv6_set).copied().flatten().map(u64::from)
-                        != Some(value.ipv6_boundaries)
+            let report_unavailable = !self.warned_missing_counts;
+            let inspect = |name: &str, expected: u64| match sets.get(name) {
+                None => {
+                    log::warn!("nftables set missing: set={name} expected_elements={expected}");
+                    (true, false)
+                }
+                Some(Some(actual)) if u64::from(*actual) != expected => {
+                    log::warn!(
+                        "nftables set element count mismatch: set={name} expected_elements={expected} actual_elements={actual}"
+                    );
+                    (true, false)
+                }
+                Some(Some(_)) => (false, false),
+                Some(None) => {
+                    if report_unavailable {
+                        log::warn!(
+                            "nftables set element count unavailable: set={name} expected_elements={expected} actual_elements=unavailable"
+                        );
+                    }
+                    (false, true)
+                }
             };
-            match (damaged(&active.inbound), damaged(&active.outbound)) {
+            let inspect_direction = |value: &DirectionGeneration| {
+                let ipv4 = inspect(&value.ipv4_set, value.ipv4_intervals);
+                let ipv6 = inspect(&value.ipv6_set, value.ipv6_intervals);
+                (ipv4.0 || ipv6.0, ipv4.1 || ipv6.1)
+            };
+            let inbound = inspect_direction(&active.inbound);
+            let outbound = inspect_direction(&active.outbound);
+            if (inbound.1 || outbound.1) && !self.warned_missing_counts {
+                log::warn!(
+                    "kernel does not report nftables set element counts; reconciliation will verify set presence but cannot detect element-count mismatches"
+                );
+                self.warned_missing_counts = true;
+            }
+            match (inbound.0, outbound.0) {
                 (false, false) => Ok(Health::Healthy),
                 (true, false) => Ok(Health::InboundDamaged),
                 (false, true) => Ok(Health::OutboundDamaged),
@@ -858,6 +902,7 @@ mod native {
 #[cfg(test)]
 pub mod test_backend {
     use super::*;
+    use std::collections::VecDeque;
     #[derive(Default)]
     pub struct MemoryBackend {
         pub layout: Option<LayoutStatus>,
@@ -866,7 +911,10 @@ pub mod test_backend {
         pub fail_next: bool,
         pub generation: u64,
         pub health: Option<Health>,
+        pub health_sequence: VecDeque<Health>,
         pub repairs: usize,
+        pub activations: Vec<Direction>,
+        pub cleanups: Vec<ActiveGenerations>,
     }
     impl Backend for MemoryBackend {
         fn layout_status(&mut self, _: &Config) -> Result<LayoutStatus, BackendError> {
@@ -886,6 +934,8 @@ pub mod test_backend {
                 direction,
                 ipv4_set: format!("v4-{}", self.generation),
                 ipv6_set: format!("v6-{}", self.generation),
+                ipv4_intervals: 0,
+                ipv6_intervals: 0,
                 ipv4_boundaries: 0,
                 ipv6_boundaries: 0,
             })
@@ -929,6 +979,7 @@ pub mod test_backend {
                 Direction::Inbound => active.inbound = generation.clone(),
                 Direction::Outbound => active.outbound = generation.clone(),
             }
+            self.activations.push(direction);
             Ok(())
         }
         fn discard(&mut self, _: &Config, _: &DirectionGeneration) -> Result<(), BackendError> {
@@ -937,12 +988,17 @@ pub mod test_backend {
         fn cleanup_obsolete(
             &mut self,
             _: &Config,
-            _: &ActiveGenerations,
+            active: &ActiveGenerations,
         ) -> Result<(), BackendError> {
+            self.cleanups.push(active.clone());
             Ok(())
         }
         fn health(&mut self, _: &Config, _: &ActiveGenerations) -> Result<Health, BackendError> {
-            Ok(self.health.unwrap_or(Health::Healthy))
+            Ok(self
+                .health_sequence
+                .pop_front()
+                .or(self.health)
+                .unwrap_or(Health::Healthy))
         }
         fn repair_rules(
             &mut self,

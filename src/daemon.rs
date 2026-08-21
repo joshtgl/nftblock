@@ -65,12 +65,8 @@ impl<B: Backend> Daemon<B> {
                 self.config.nftables.table
             ),
         }
-        if let Err(error) = self.load_both("startup") {
-            log::error!(
-                "startup blocklists rejected; preserving the existing generation: {error:#}"
-            );
-        }
-        Ok(())
+        self.replace_both("startup")
+            .context("startup could not activate and verify both blocklists")
     }
 
     fn stage(&mut self, direction: Direction, reason: &str) -> Result<DirectionGeneration> {
@@ -97,12 +93,15 @@ impl<B: Backend> Daemon<B> {
         match result {
             Ok(stats) => {
                 log::info!(
-                    "staged blocklist: reason={reason} direction={} path={} source_cidrs={} boundary_elements={} ipv4_boundary_elements={} ipv6_boundary_elements={} ipv4_set={} ipv6_set={}",
+                    "staged blocklist: reason={reason} direction={} path={} source_cidrs={} set_elements={} boundary_elements={} ipv4_set_elements={} ipv4_boundary_elements={} ipv6_set_elements={} ipv6_boundary_elements={} ipv4_set={} ipv6_set={}",
                     direction_name(direction),
                     path.display(),
                     stats.cidrs,
+                    stats.ipv4_intervals + stats.ipv6_intervals,
                     stats.ipv4_boundaries + stats.ipv6_boundaries,
+                    stats.ipv4_intervals,
                     stats.ipv4_boundaries,
+                    stats.ipv6_intervals,
                     stats.ipv6_boundaries,
                     stage.ipv4_set,
                     stage.ipv6_set
@@ -119,7 +118,26 @@ impl<B: Backend> Daemon<B> {
         }
     }
 
-    fn load_both(&mut self, reason: &str) -> Result<()> {
+    fn replace_both(&mut self, reason: &str) -> Result<()> {
+        if self.active.is_some() {
+            log::info!("sequential blocklist replacement triggered: reason={reason}");
+            self.reload_for(Direction::Inbound, reason)?;
+            self.reload_for(Direction::Outbound, reason)?;
+            let active = self
+                .active
+                .clone()
+                .expect("replacement retained active state");
+            self.verify_candidate(&active, None, reason)?;
+            log::info!(
+                "sequential blocklist replacement complete: reason={reason} inbound_ipv4_set={} inbound_ipv6_set={} outbound_ipv4_set={} outbound_ipv6_set={}",
+                active.inbound.ipv4_set,
+                active.inbound.ipv6_set,
+                active.outbound.ipv4_set,
+                active.outbound.ipv6_set
+            );
+            return Ok(());
+        }
+
         let inbound = self.stage(Direction::Inbound, reason)?;
         let outbound = match self.stage(Direction::Outbound, reason) {
             Ok(value) => value,
@@ -131,6 +149,14 @@ impl<B: Backend> Daemon<B> {
             }
         };
         let candidate = ActiveGenerations { inbound, outbound };
+        if let Err(error) = self.verify_candidate(&candidate, None, reason) {
+            for stage in [&candidate.inbound, &candidate.outbound] {
+                if let Err(cleanup) = self.backend.discard(&self.config, stage) {
+                    log::error!("failed to discard unhealthy staging sets: {cleanup}");
+                }
+            }
+            return Err(error);
+        }
         if let Err(error) = self
             .backend
             .activate_initial(&self.config, &self.rules, &candidate)
@@ -143,8 +169,11 @@ impl<B: Backend> Daemon<B> {
             return Err(error.into());
         }
         self.active = Some(candidate.clone());
-        if let Err(error) = self.backend.cleanup_obsolete(&self.config, &candidate) {
-            log::error!("obsolete generation cleanup deferred: {error}");
+        match self.backend.cleanup_obsolete(&self.config, &candidate) {
+            Ok(()) => log::info!(
+                "obsolete generation cleanup complete: reason={reason} direction=combined"
+            ),
+            Err(error) => log::error!("obsolete generation cleanup deferred: {error}"),
         }
         log::info!(
             "activated blocklist generations: reason={reason} inbound_ipv4_set={} inbound_ipv4_boundary_elements={} inbound_ipv6_set={} inbound_ipv6_boundary_elements={} outbound_ipv4_set={} outbound_ipv4_boundary_elements={} outbound_ipv6_set={} outbound_ipv6_boundary_elements={}",
@@ -166,13 +195,24 @@ impl<B: Backend> Daemon<B> {
 
     fn reload_for(&mut self, direction: Direction, reason: &str) -> Result<()> {
         if self.active.is_none() {
-            return self.load_both(reason);
+            return self.replace_both(reason);
         }
         log::info!(
             "blocklist reload triggered: reason={reason} direction={}",
             direction_name(direction)
         );
         let stage = self.stage(direction, reason)?;
+        let mut candidate = self.active.clone().expect("checked active state");
+        match direction {
+            Direction::Inbound => candidate.inbound = stage.clone(),
+            Direction::Outbound => candidate.outbound = stage.clone(),
+        }
+        if let Err(error) = self.verify_candidate(&candidate, Some(direction), reason) {
+            if let Err(cleanup) = self.backend.discard(&self.config, &stage) {
+                log::error!("failed to discard unhealthy staging sets: {cleanup}");
+            }
+            return Err(error);
+        }
         if let Err(error) = self
             .backend
             .activate_direction(&self.config, direction, &stage)
@@ -182,26 +222,64 @@ impl<B: Backend> Daemon<B> {
             }
             return Err(error.into());
         }
-        let active = self.active.as_mut().expect("checked active state");
-        match direction {
-            Direction::Inbound => active.inbound = stage,
-            Direction::Outbound => active.outbound = stage,
-        }
-        let active = active.clone();
-        if let Err(error) = self.backend.cleanup_obsolete(&self.config, &active) {
-            log::error!("obsolete generation cleanup deferred: {error}");
+        self.active = Some(candidate.clone());
+        match self.backend.cleanup_obsolete(&self.config, &candidate) {
+            Ok(()) => log::info!(
+                "obsolete generation cleanup complete: reason={reason} direction={}",
+                direction_name(direction)
+            ),
+            Err(error) => log::error!("obsolete generation cleanup deferred: {error}"),
         }
         let generation = match direction {
-            Direction::Inbound => &active.inbound,
-            Direction::Outbound => &active.outbound,
+            Direction::Inbound => &candidate.inbound,
+            Direction::Outbound => &candidate.outbound,
         };
         log::info!(
-            "activated blocklist generation: reason={reason} direction={} ipv4_set={} ipv4_boundary_elements={} ipv6_set={} ipv6_boundary_elements={}",
+            "activated blocklist generation: reason={reason} direction={} ipv4_set={} ipv4_set_elements={} ipv4_boundary_elements={} ipv6_set={} ipv6_set_elements={} ipv6_boundary_elements={}",
             direction_name(direction),
             generation.ipv4_set,
+            generation.ipv4_intervals,
             generation.ipv4_boundaries,
             generation.ipv6_set,
+            generation.ipv6_intervals,
             generation.ipv6_boundaries
+        );
+        Ok(())
+    }
+
+    fn verify_candidate(
+        &mut self,
+        candidate: &ActiveGenerations,
+        replaced: Option<Direction>,
+        reason: &str,
+    ) -> Result<()> {
+        let health = self.backend.health(&self.config, candidate)?;
+        let candidate_is_healthy = match replaced {
+            None => health == Health::Healthy,
+            Some(Direction::Inbound) => {
+                matches!(health, Health::Healthy | Health::OutboundDamaged)
+            }
+            Some(Direction::Outbound) => {
+                matches!(health, Health::Healthy | Health::InboundDamaged)
+            }
+        };
+        if !candidate_is_healthy {
+            bail!(
+                "staged {} blocklist failed immediate health verification: health={health:?} inbound_ipv4_set={} inbound_ipv4_expected_elements={} inbound_ipv6_set={} inbound_ipv6_expected_elements={} outbound_ipv4_set={} outbound_ipv4_expected_elements={} outbound_ipv6_set={} outbound_ipv6_expected_elements={}",
+                replaced.map(direction_name).unwrap_or("combined"),
+                candidate.inbound.ipv4_set,
+                candidate.inbound.ipv4_intervals,
+                candidate.inbound.ipv6_set,
+                candidate.inbound.ipv6_intervals,
+                candidate.outbound.ipv4_set,
+                candidate.outbound.ipv4_intervals,
+                candidate.outbound.ipv6_set,
+                candidate.outbound.ipv6_intervals
+            );
+        }
+        log::info!(
+            "staged blocklist health verified: reason={reason} direction={} health={health:?}",
+            replaced.map(direction_name).unwrap_or("combined")
         );
         Ok(())
     }
@@ -291,7 +369,7 @@ impl<B: Backend> Daemon<B> {
     fn reconcile(&mut self) -> Result<()> {
         let Some(active) = self.active.clone() else {
             log::warn!("reconciliation found no active generation; repopulating both blocklists");
-            return self.load_both("periodic reconciliation found no active generation");
+            return self.replace_both("periodic reconciliation found no active generation");
         };
         match self.backend.layout_status(&self.config)? {
             LayoutStatus::Absent => {
@@ -300,7 +378,8 @@ impl<B: Backend> Daemon<B> {
                     self.config.nftables.table
                 );
                 self.backend.bootstrap(&self.config, &self.rules)?;
-                return self.load_both("periodic reconciliation found table absent");
+                self.active = None;
+                return self.replace_both("periodic reconciliation found table absent");
             }
             LayoutStatus::Incompatible => bail!(
                 "table inet {} lost its generation-layout marker; refusing to modify an unversioned table",
@@ -313,7 +392,7 @@ impl<B: Backend> Daemon<B> {
                 self.backend
                     .repair_rules(&self.config, &self.rules, &active)?;
                 log::info!(
-                    "reconciliation complete: generation element counts healthy; rules_repaired=true sets_repopulated=false inbound_ipv4_set={} inbound_ipv6_set={} outbound_ipv4_set={} outbound_ipv6_set={}",
+                    "reconciliation complete: generation sets healthy; rules_repaired=true sets_repopulated=false inbound_ipv4_set={} inbound_ipv6_set={} outbound_ipv4_set={} outbound_ipv6_set={}",
                     active.inbound.ipv4_set,
                     active.inbound.ipv6_set,
                     active.outbound.ipv4_set,
@@ -332,7 +411,7 @@ impl<B: Backend> Daemon<B> {
                 log::warn!(
                     "reconciliation found multiple missing or mismatched sets; repopulating both blocklists"
                 );
-                self.load_both("periodic reconciliation found layout damage")?;
+                self.replace_both("periodic reconciliation found layout damage")?;
             }
         }
         Ok(())
@@ -363,6 +442,9 @@ fn check_flowtables<B: Backend>(
 
 pub fn classify_event(event: &Event, inbound: &Path, outbound: &Path) -> BTreeSet<Direction> {
     let mut found = BTreeSet::new();
+    if matches!(event.kind, notify::EventKind::Access(_)) {
+        return found;
+    }
     for path in &event.paths {
         if same_target(path, inbound) {
             found.insert(Direction::Inbound);
@@ -390,7 +472,7 @@ mod tests {
         EventKind,
         event::{ModifyKind, RenameMode},
     };
-    use std::{fs, path::PathBuf};
+    use std::{collections::VecDeque, fs, path::PathBuf};
 
     fn config(root: &Path) -> Config {
         fs::write(root.join("zones.json"), r#"{"WAN":["eth0"]}"#).unwrap();
@@ -432,6 +514,25 @@ mod tests {
                 Path::new("/lists/outbound.txt")
             )
             .contains(&Direction::Inbound)
+        );
+    }
+
+    #[test]
+    fn ignores_file_access_events() {
+        let event = Event {
+            kind: EventKind::Access(notify::event::AccessKind::Close(
+                notify::event::AccessMode::Read,
+            )),
+            paths: vec![PathBuf::from("/lists/inbound.txt")],
+            attrs: Default::default(),
+        };
+        assert!(
+            classify_event(
+                &event,
+                Path::new("/lists/inbound.txt"),
+                Path::new("/lists/outbound.txt")
+            )
+            .is_empty()
         );
     }
 
@@ -519,7 +620,7 @@ mod tests {
         daemon.initial_load().unwrap();
         let old = daemon.active.clone().unwrap();
         let generation = daemon.backend.generation;
-        daemon.backend.health = Some(Health::InboundDamaged);
+        daemon.backend.health_sequence = VecDeque::from([Health::InboundDamaged, Health::Healthy]);
 
         daemon.reconcile().unwrap();
 
@@ -528,5 +629,74 @@ mod tests {
         assert_eq!(active.outbound, old.outbound);
         assert_eq!(daemon.backend.generation, generation + 1);
         assert_eq!(daemon.backend.repairs, 0);
+    }
+
+    #[test]
+    fn layout_damage_replaces_and_cleans_directions_sequentially() {
+        let root = tempfile::tempdir().unwrap();
+        let cfg = config(root.path());
+        fs::write(&cfg.files.inbound, "10.0.0.0/8\n").unwrap();
+        fs::write(&cfg.files.outbound, "2001:db8::/32\n").unwrap();
+        let mut daemon = Daemon::new(cfg, MemoryBackend::default()).unwrap();
+        daemon.initial_load().unwrap();
+        let old = daemon.active.clone().unwrap();
+        daemon.backend.activations.clear();
+        daemon.backend.cleanups.clear();
+        daemon.backend.health_sequence = VecDeque::from([
+            Health::LayoutDamaged,
+            Health::OutboundDamaged,
+            Health::Healthy,
+            Health::Healthy,
+        ]);
+
+        daemon.reconcile().unwrap();
+
+        let active = daemon.active.as_ref().unwrap();
+        assert_ne!(active.inbound, old.inbound);
+        assert_ne!(active.outbound, old.outbound);
+        assert_eq!(
+            daemon.backend.activations,
+            [Direction::Inbound, Direction::Outbound]
+        );
+        assert_eq!(daemon.backend.cleanups.len(), 2);
+        assert_ne!(daemon.backend.cleanups[0].inbound, old.inbound);
+        assert_eq!(daemon.backend.cleanups[0].outbound, old.outbound);
+        assert_eq!(daemon.backend.cleanups[1], *active);
+    }
+
+    #[test]
+    fn immediate_health_failure_rejects_staged_generation() {
+        let root = tempfile::tempdir().unwrap();
+        let cfg = config(root.path());
+        fs::write(&cfg.files.inbound, "10.0.0.0/8\n").unwrap();
+        fs::write(&cfg.files.outbound, "2001:db8::/32\n").unwrap();
+        let mut daemon = Daemon::new(cfg, MemoryBackend::default()).unwrap();
+        daemon.initial_load().unwrap();
+        let old = daemon.active.clone();
+        daemon.backend.health = Some(Health::InboundDamaged);
+
+        let error = daemon.reload(Direction::Inbound).unwrap_err().to_string();
+
+        assert!(error.contains("failed immediate health verification"));
+        assert_eq!(daemon.active, old);
+    }
+
+    #[test]
+    fn unhealthy_startup_returns_error_without_activating_generation() {
+        let root = tempfile::tempdir().unwrap();
+        let cfg = config(root.path());
+        fs::write(&cfg.files.inbound, "10.0.0.0/8\n").unwrap();
+        fs::write(&cfg.files.outbound, "2001:db8::/32\n").unwrap();
+        let backend = MemoryBackend {
+            health: Some(Health::InboundDamaged),
+            ..Default::default()
+        };
+        let mut daemon = Daemon::new(cfg, backend).unwrap();
+
+        let error = daemon.initial_load().unwrap_err().to_string();
+
+        assert!(error.contains("startup could not activate and verify both blocklists"));
+        assert!(daemon.active.is_none());
+        assert!(daemon.backend.active.is_none());
     }
 }

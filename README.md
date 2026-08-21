@@ -55,13 +55,20 @@ rejected. Adjacent CIDRs are coalesced into one nftables interval while streamin
 
 `populate_batch_elements` bounds the number of nftables interval-boundary elements held in each
 population transaction (default `2000`). `batch_page_bytes` controls the page size within that
-bounded transaction (default `131072`). Reloads temporarily retain both generations in kernel
-memory, but userspace memory is bounded by the configured population size instead of the complete
-list.
+bounded transaction (default `131072`). Each direction is staged, health-checked, atomically
+activated, and cleaned up before replacement of the other direction begins. This temporarily
+retains only the old and new generations for one direction at a time. Userspace memory is bounded
+by the configured population size instead of the complete list.
 
 Tables created by releases before the generation layout are intentionally incompatible. If the
 configured table exists without the current layout marker, nftblock exits without modifying it;
 remove that table explicitly before starting the new release.
+
+Every staged generation is checked with the same set-presence and logical-element-count checks
+used by periodic reconciliation before its rules are activated. A rejected reload retains the
+known-good active generation. If startup cannot stage, verify, and activate both directions,
+nftblock exits nonzero instead of running without a tracked active generation; any pre-existing
+nftables table remains preserved for inspection.
 
 ## Container
 
@@ -87,10 +94,3 @@ The Rust suite covers parsing, interval encoding, configuration rendering, atomi
 classification, failed-stage retention, bounded multi-page construction, and incompatible-layout
 rejection. The namespace test exercises native chunked input, forward, and output rules without
 touching the host ruleset.
-
-An ignored release-mode test streams and serializes 4,228,762 entries and enforces a 256 MiB Linux
-peak-RSS budget:
-
-```console
-cargo test --release netlink::native::tests::streams_4_2m_entries_under_256_mib -- --ignored --exact --nocapture
-```
