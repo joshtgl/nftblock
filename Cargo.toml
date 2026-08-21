@@ -10,22 +10,22 @@ default = ["native-netlink"]
 native-netlink = ["dep:nftnl", "dep:mnl"]
 
 [dependencies]
-anyhow = "1.0"
-clap = { version = "4.5", features = ["derive", "env"] }
-env_logger = "0.11"
-ipnet = { version = "2.11", features = ["serde"] }
-log = "0.4"
+anyhow = "1.0.104"
+clap = { version = "4.6.6", features = ["derive", "env"] }
+env_logger = "0.11.11"
+ipnet = { version = "2.12.1", features = ["serde"] }
+log = "0.4.33"
 notify = "8.2"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-signal-hook = "0.3"
-thiserror = "2.0"
-toml = "0.9"
-nftnl = { version = "0.9", optional = true, features = ["nftnl-1-1-6"] }
-mnl = { version = "0.3", optional = true }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+signal-hook = "0.4.4"
+thiserror = "2.0.20"
+toml = "0.9.12"
+nftnl = { version = "0.9.4", optional = true, features = ["nftnl-1-1-6"] }
+mnl = { version = "0.3.1", optional = true }
 
 [dev-dependencies]
-tempfile = "3.20"
+tempfile = "3.27.0"
 
 [lints.rust]
 unsafe_code = "deny"
