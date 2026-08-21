@@ -13,8 +13,8 @@ VPN2 = ["wg1"]
 [nftables]
 table = "nftblock"
 priority = -5
-batch_page_bytes = 262144
-populate_batch_elements = 100000
+batch_page_bytes = 131072
+populate_batch_elements = 2000
 allow_flowtable_bypass = false
 
 [runtime]

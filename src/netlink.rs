@@ -797,7 +797,7 @@ mod native {
         #[ignore = "release-mode 4.2-million-entry RSS validation"]
         fn streams_4_2m_entries_under_256_mib() {
             const ENTRY_COUNT: u32 = 4_228_762;
-            const BOUNDARY_LIMIT: usize = 100_000;
+            const BOUNDARY_LIMIT: usize = 2_000;
             let file = tempfile::NamedTempFile::new().unwrap();
             {
                 let mut writer = BufWriter::new(file.as_file());
@@ -820,7 +820,7 @@ mod native {
                     boundaries += interval.boundary_elements();
                 }
                 assert!(boundaries <= BOUNDARY_LIMIT);
-                let mut batch = Batch::with_page_size(256 * 1024);
+                let mut batch = Batch::with_page_size(128 * 1024);
                 batch.add_iter(
                     set.as_set().elems_iter().map(ExistingElements::new),
                     MsgType::Add,

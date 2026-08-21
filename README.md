@@ -54,9 +54,10 @@ ordered, disjoint IPv6 entries. Duplicates, overlaps, host bits, and IPv4 entrie
 rejected. Adjacent CIDRs are coalesced into one nftables interval while streaming.
 
 `populate_batch_elements` bounds the number of nftables interval-boundary elements held in each
-population transaction (default `100000`). `batch_page_bytes` controls pages within that bounded
-transaction. Reloads temporarily retain both generations in kernel memory, but userspace memory is
-bounded by the configured population size instead of the complete list.
+population transaction (default `2000`). `batch_page_bytes` controls the page size within that
+bounded transaction (default `131072`). Reloads temporarily retain both generations in kernel
+memory, but userspace memory is bounded by the configured population size instead of the complete
+list.
 
 Tables created by releases before the generation layout are intentionally incompatible. If the
 configured table exists without the current layout marker, nftblock exits without modifying it;

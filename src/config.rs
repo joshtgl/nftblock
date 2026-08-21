@@ -76,8 +76,8 @@ impl Default for Nftables {
             table: "nftblock".into(),
             priority: -5,
             allow_flowtable_bypass: false,
-            batch_page_bytes: 256 * 1024,
-            populate_batch_elements: 100_000,
+            batch_page_bytes: 128 * 1024,
+            populate_batch_elements: 2_000,
         }
     }
 }
