@@ -1,0 +1,118 @@
+name: Release PR dry run
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: Release PR number to verify before merging
+        required: true
+        type: number
+
+permissions:
+  contents: read
+
+env:
+  STATUS_CONTEXT: release dry run
+
+jobs:
+  resolve-pr:
+    name: Resolve release PR
+    runs-on: ubuntu-latest
+    outputs:
+      head_sha: ${{ steps.pr.outputs.head_sha }}
+      head_repo: ${{ steps.pr.outputs.head_repo }}
+      version: ${{ steps.pr.outputs.version }}
+    permissions:
+      contents: read
+      pull-requests: read
+      statuses: write
+    steps:
+      - name: Resolve PR head
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ inputs.pr }}
+        run: |
+          set -euo pipefail
+          pr_json="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
+            --json state,baseRefName,headRefOid,headRepositoryOwner,headRepository,url)"
+
+          state="$(jq -r .state <<< "$pr_json")"
+          base_ref="$(jq -r .baseRefName <<< "$pr_json")"
+          if [[ "$state" != "OPEN" || "$base_ref" != "main" ]]; then
+            echo "PR #$PR_NUMBER must be open and target main" >&2
+            exit 1
+          fi
+
+          head_sha="$(jq -r .headRefOid <<< "$pr_json")"
+          head_repo="$(jq -r '.headRepositoryOwner.login + "/" + .headRepository.name' <<< "$pr_json")"
+          version="$(gh api "/repos/$head_repo/contents/Cargo.toml?ref=$head_sha" \
+            --jq .content | base64 --decode | sed -n 's/^version = "\([^"]*\)"/\1/p' | head -1)"
+          test -n "$version"
+
+          echo "head_sha=$head_sha" >> "$GITHUB_OUTPUT"
+          echo "head_repo=$head_repo" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Mark dry run pending
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          TARGET_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh api --method POST "/repos/$GITHUB_REPOSITORY/statuses/$HEAD_SHA" \
+            -f state=pending \
+            -f context="$STATUS_CONTEXT" \
+            -f description="Release artifact dry run is in progress" \
+            -f target_url="$TARGET_URL"
+
+  release-artifacts:
+    name: Build release artifacts
+    needs: resolve-pr
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      artifact-metadata: write
+      id-token: write
+    uses: ./.github/workflows/release-artifacts.yml
+    with:
+      repository: ${{ needs.resolve-pr.outputs.head_repo }}
+      ref: ${{ needs.resolve-pr.outputs.head_sha }}
+      version: ${{ needs.resolve-pr.outputs.version }}
+      publish_artifacts: false
+
+  publish-status:
+    name: Publish dry run status
+    needs:
+      - resolve-pr
+      - release-artifacts
+    if: ${{ always() && needs.resolve-pr.outputs.head_sha != '' }}
+    runs-on: ubuntu-latest
+    permissions:
+      statuses: write
+    steps:
+      - name: Publish final status
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_SHA: ${{ needs.resolve-pr.outputs.head_sha }}
+          TARGET_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          RELEASE_ARTIFACTS_RESULT: ${{ needs.release-artifacts.result }}
+        run: |
+          set -euo pipefail
+          state=success
+          description="Release artifact dry run passed"
+          if [[ "$RELEASE_ARTIFACTS_RESULT" == "cancelled" ]]; then
+            state=error
+            description="Release artifact dry run was cancelled"
+          elif [[ "$RELEASE_ARTIFACTS_RESULT" != "success" ]]; then
+            state=failure
+            description="Release artifact dry run failed"
+          fi
+
+          gh api --method POST "/repos/$GITHUB_REPOSITORY/statuses/$HEAD_SHA" \
+            -f state="$state" \
+            -f context="$STATUS_CONTEXT" \
+            -f description="$description" \
+            -f target_url="$TARGET_URL"
+          [[ "$state" == "success" ]]

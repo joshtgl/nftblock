@@ -1,0 +1,62 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended"
+  ],
+  "labels": [
+    "dependencies"
+  ],
+  "rangeStrategy": "bump",
+  "dependencyDashboard": true,
+  "prConcurrentLimit": 5,
+  "customManagers": [
+    {
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^\\.github\\/workflows\\/release\\.yml$/"
+      ],
+      "matchStrings": [
+        "uses: release-plz/action@[^\\n]+\\n\\s+with:\\n\\s+command: \\S+\\n\\s+version: (?<currentValue>\\S+)"
+      ],
+      "depNameTemplate": "release-plz",
+      "datasourceTemplate": "crate"
+    },
+    {
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^\\.github\\/workflows\\/release-artifacts\\.yml$/"
+      ],
+      "matchStrings": [
+        "cargo install cargo-cyclonedx --version (?<currentValue>\\S+) --locked"
+      ],
+      "depNameTemplate": "cargo-cyclonedx",
+      "datasourceTemplate": "crate"
+    }
+  ],
+  "packageRules": [
+    {
+      "matchManagers": [
+        "cargo"
+      ],
+      "groupName": "rust dependencies"
+    },
+    {
+      "matchManagers": [
+        "github-actions"
+      ],
+      "groupName": "github actions"
+    },
+    {
+      "matchUpdateTypes": [
+        "minor",
+        "patch",
+        "pin",
+        "digest"
+      ],
+      "automerge": true,
+      "minimumReleaseAge": "3 days",
+      "prCreation": "not-pending",
+      "internalChecksFilter": "strict"
+    }
+  ]
+}

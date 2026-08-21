@@ -1,0 +1,161 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Build and verify release artifacts without publishing them
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    name: Release unpublished crate
+    runs-on: ubuntu-latest
+    outputs:
+      releases: ${{ steps.release_plz.outputs.releases }}
+      releases_created: ${{ steps.release_plz.outputs.releases_created }}
+      artifact_version: ${{ steps.release_mode.outputs.artifact_version }}
+      should_build_artifacts: ${{ steps.release_mode.outputs.should_build_artifacts }}
+      should_publish_artifacts: ${{ steps.release_mode.outputs.should_publish_artifacts }}
+    permissions:
+      contents: write
+      id-token: write
+      pull-requests: read
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install native dependencies
+        run: sudo apt-get update && sudo apt-get install -y libmnl-dev libnftnl-dev pkg-config
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: stable
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Run release-plz release
+        id: release_plz
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
+        uses: release-plz/action@2eb1d8bcb770b4c48ccfaad919734b38b51958c9 # v0.5.131
+        with:
+          command: release
+          version: 0.3.158
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Determine release mode
+        id: release_mode
+        env:
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+          RELEASES: ${{ steps.release_plz.outputs.releases }}
+          RELEASES_CREATED: ${{ steps.release_plz.outputs.releases_created }}
+        run: |
+          set -euo pipefail
+          if [[ "$DRY_RUN" == "true" ]]; then
+            version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+            echo "artifact_version=$version" >> "$GITHUB_OUTPUT"
+            echo "should_build_artifacts=true" >> "$GITHUB_OUTPUT"
+            echo "should_publish_artifacts=false" >> "$GITHUB_OUTPUT"
+          elif [[ "$RELEASES_CREATED" == "true" ]]; then
+            version="$(jq -r '.[0].version' <<< "$RELEASES")"
+            echo "artifact_version=$version" >> "$GITHUB_OUTPUT"
+            echo "should_build_artifacts=true" >> "$GITHUB_OUTPUT"
+            echo "should_publish_artifacts=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "artifact_version=" >> "$GITHUB_OUTPUT"
+            echo "should_build_artifacts=false" >> "$GITHUB_OUTPUT"
+            echo "should_publish_artifacts=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  release-pr:
+    name: Create or update release PR
+    needs: release
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    concurrency:
+      group: release-plz-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install native dependencies
+        run: sudo apt-get update && sudo apt-get install -y libmnl-dev libnftnl-dev pkg-config
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: stable
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Run release-plz release-pr
+        uses: release-plz/action@2eb1d8bcb770b4c48ccfaad919734b38b51958c9 # v0.5.131
+        with:
+          command: release-pr
+          version: 0.3.158
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  release-artifacts:
+    name: Build release artifacts
+    needs: release
+    if: needs.release.outputs.should_build_artifacts == 'true'
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      artifact-metadata: write
+      id-token: write
+    uses: ./.github/workflows/release-artifacts.yml
+    with:
+      repository: ${{ github.repository }}
+      ref: ${{ github.sha }}
+      version: ${{ needs.release.outputs.artifact_version }}
+      publish_artifacts: ${{ fromJSON(needs.release.outputs.should_publish_artifacts) }}
+
+  publish-static-binary:
+    name: Publish static release binary
+    needs:
+      - release
+      - release-artifacts
+    if: needs.release.outputs.should_publish_artifacts == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download static binary artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: static-binaries-x86_64-unknown-linux-gnu
+          path: dist/static
+
+      - name: Upload static binary to GitHub Release
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+        with:
+          tag_name: ${{ fromJSON(needs.release.outputs.releases)[0].tag }}
+          files: |
+            dist/static/*.tar.gz
+            dist/static/*.cdx.json
+          fail_on_unmatched_files: true
