@@ -32,6 +32,8 @@ pub struct Cli {
     pub reconcile_secs: Option<u64>,
     #[arg(long, env = "NFTBLOCK_ALLOW_FLOWTABLE_BYPASS")]
     pub allow_flowtable_bypass: Option<bool>,
+    #[arg(long, env = "NFTBLOCK_POPULATE_BATCH_ELEMENTS")]
+    pub populate_batch_elements: Option<u32>,
     #[arg(long, help = "Validate configuration and print the resolved rules")]
     pub check: bool,
 }
@@ -66,6 +68,7 @@ pub struct Nftables {
     pub priority: i32,
     pub allow_flowtable_bypass: bool,
     pub batch_page_bytes: u32,
+    pub populate_batch_elements: u32,
 }
 impl Default for Nftables {
     fn default() -> Self {
@@ -74,6 +77,7 @@ impl Default for Nftables {
             priority: -5,
             allow_flowtable_bypass: false,
             batch_page_bytes: 256 * 1024,
+            populate_batch_elements: 100_000,
         }
     }
 }
@@ -149,6 +153,9 @@ impl Config {
         if let Some(v) = cli.allow_flowtable_bypass {
             value.nftables.allow_flowtable_bypass = v;
         }
+        if let Some(v) = cli.populate_batch_elements {
+            value.nftables.populate_batch_elements = v;
+        }
         value.validate()?;
         Ok(value)
     }
@@ -168,6 +175,9 @@ impl Config {
         }
         if self.nftables.batch_page_bytes < 64 * 1024 {
             bail!("batch_page_bytes must be at least 65536")
+        }
+        if self.nftables.populate_batch_elements == 0 {
+            bail!("populate_batch_elements must be non-zero")
         }
         if self.rules.input.is_empty()
             && self.rules.forward.is_empty()
@@ -272,6 +282,7 @@ ingress_zones = ["WAN"]
             debounce_ms: None,
             reconcile_secs: None,
             allow_flowtable_bypass: None,
+            populate_batch_elements: None,
             check: false,
         };
 

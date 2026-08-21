@@ -1,9 +1,10 @@
 # nftblock
 
 `nftblock` watches Blockmerge's newline-delimited mixed IPv4/IPv6 CIDR files and owns a single
-`inet nftblock` table. Every accepted reload is parsed completely first and then sent through
-`libnftnl`/`libmnl` as one atomic, paged netlink transaction. A parse, allocation, or kernel error
-leaves the active table unchanged. The daemon never invokes the `nft` executable.
+`inet nftblock` table. It streams canonical input into bounded, unreferenced generation sets and
+then atomically switches stable dispatch chains to the completed generation. A parse, allocation,
+or kernel error leaves the active generation unchanged. The daemon never invokes the `nft`
+executable.
 
 The table contains separate interval sets for inbound/outbound IPv4/IPv6 traffic and base chains
 for input, forward, and output. Normal SIGINT/SIGTERM shutdown deliberately preserves the table.
@@ -47,9 +48,19 @@ Blocklist syntax remains producer-neutral:
 2001:db8::/32
 ```
 
-Blank lines and comments are ignored. Any other line must be a CIDR. Networks are normalized and
-exact duplicates are removed. Blockmerge must remove overlaps before publishing a list; nftblock
-does not perform producer-side aggregation.
+Blank lines and comments are ignored. Any other line must be a normalized CIDR. nftblock requires
+Blockmerge's canonical ordering: numerically ordered, disjoint IPv4 entries followed by numerically
+ordered, disjoint IPv6 entries. Duplicates, overlaps, host bits, and IPv4 entries after IPv6 are
+rejected. Adjacent CIDRs are coalesced into one nftables interval while streaming.
+
+`populate_batch_elements` bounds the number of nftables interval-boundary elements held in each
+population transaction (default `100000`). `batch_page_bytes` controls pages within that bounded
+transaction. Reloads temporarily retain both generations in kernel memory, but userspace memory is
+bounded by the configured population size instead of the complete list.
+
+Tables created by releases before the generation layout are intentionally incompatible. If the
+configured table exists without the current layout marker, nftblock exits without modifying it;
+remove that table explicitly before starting the new release.
 
 ## Container
 
@@ -72,5 +83,13 @@ sudo ./tests/netns.sh
 ```
 
 The Rust suite covers parsing, interval encoding, configuration rendering, atomic rename event
-classification, failed-batch retention, and multi-page construction. The namespace test exercises
-the native input, forward, and output rules without touching the host ruleset.
+classification, failed-stage retention, bounded multi-page construction, and incompatible-layout
+rejection. The namespace test exercises native chunked input, forward, and output rules without
+touching the host ruleset.
+
+An ignored release-mode test streams and serializes 4,228,762 entries and enforces a 256 MiB Linux
+peak-RSS budget:
+
+```console
+cargo test --release netlink::native::tests::streams_4_2m_entries_under_256_mib -- --ignored --exact --nocapture
+```

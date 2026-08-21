@@ -11,12 +11,13 @@
 //! wrappers can be removed as equivalent APIs become available there.
 
 use nftnl::{
-    MsgType, NlMsg, ProtoFamily, Table,
+    Chain, MsgType, NlMsg, ProtoFamily, Rule, Table,
+    expr::Expression,
     nftnl_sys::{self as sys, libc},
     set::{Set, SetKey},
 };
 use std::{
-    ffi::{CStr, c_void},
+    ffi::{CStr, CString, c_void},
     io,
     mem::{align_of, size_of},
     os::raw::c_char,
@@ -24,6 +25,8 @@ use std::{
 };
 
 const NFT_MSG_GETFLOWTABLE: u16 = 23;
+const NFT_MSG_GETTABLE: u16 = 1;
+const NFT_MSG_GETSET: u16 = 10;
 const MAX_FLOWTABLE_DEVICES: usize = 4096;
 
 /// Releases one kind of uniquely owned C allocation.
@@ -106,6 +109,11 @@ impl<'table, K: SetKey> IntervalSet<'table, K> {
         Self { inner }
     }
 
+    /// Select a named set created by an earlier transaction.
+    pub(super) fn existing(name: &CStr, table: &'table Table) -> Self {
+        Self::new(name, 0, table)
+    }
+
     pub(super) fn add_range(&mut self, first: &K, after_last: Option<&K>) -> io::Result<()> {
         SetElement::new()?.set_key(first)?.attach(&mut self.inner);
         if let Some(after_last) = after_last {
@@ -119,6 +127,110 @@ impl<'table, K: SetKey> IntervalSet<'table, K> {
 
     pub(super) fn as_set(&self) -> &Set<'table, K> {
         &self.inner
+    }
+}
+
+pub(super) struct ExistingElements<T>(T);
+impl<T> ExistingElements<T> {
+    pub(super) fn new(value: T) -> Self {
+        Self(value)
+    }
+}
+
+// SAFETY: the inner serializer satisfies NlMsg; removing one complete, aligned top-level
+// attribute only shortens that already bounded message.
+unsafe impl<T: NlMsg> NlMsg for ExistingElements<T> {
+    unsafe fn write(&self, buffer: *mut c_void, seq: u32, message_type: MsgType) {
+        // SAFETY: inherited directly from the outer NlMsg call.
+        unsafe { self.0.write(buffer, seq, message_type) };
+        // SAFETY: the inner call initialized a bounded netlink message in `buffer`.
+        unsafe { remove_top_level_attribute(buffer, 4) };
+    }
+}
+
+pub(super) struct ExistingSetMessage<'set, 'table, K>(&'set Set<'table, K>);
+impl<'set, 'table, K> ExistingSetMessage<'set, 'table, K> {
+    pub(super) fn new(set: &'set Set<'table, K>) -> Self {
+        Self(set)
+    }
+}
+
+// SAFETY: the inner serializer satisfies NlMsg; removing the transaction-local ID leaves a
+// persistent table/name set selector.
+unsafe impl<K> NlMsg for ExistingSetMessage<'_, '_, K> {
+    unsafe fn write(&self, buffer: *mut c_void, seq: u32, message_type: MsgType) {
+        // SAFETY: inherited directly from the outer NlMsg call.
+        unsafe { self.0.write(buffer, seq, message_type) };
+        // SAFETY: the inner call initialized a bounded netlink message in `buffer`.
+        unsafe { remove_top_level_attribute(buffer, 10) };
+    }
+}
+
+unsafe fn remove_top_level_attribute(buffer: *mut c_void, target: u16) {
+    const NFGENMSG_LEN: usize = 4;
+    const NLA_HEADER_LEN: usize = 4;
+    const NLA_TYPE_MASK: u16 = 0x3fff;
+    let header = buffer.cast::<libc::nlmsghdr>();
+    // SAFETY: guaranteed by this helper's contract.
+    let len = unsafe { (*header).nlmsg_len as usize };
+    // SAFETY: guaranteed by this helper's contract.
+    let bytes = unsafe { std::slice::from_raw_parts_mut(buffer.cast::<u8>(), len) };
+    let mut offset = size_of::<libc::nlmsghdr>() + NFGENMSG_LEN;
+    while offset + NLA_HEADER_LEN <= len {
+        let attr_len =
+            u16::from_ne_bytes(bytes[offset..offset + 2].try_into().expect("NLA header")) as usize;
+        if attr_len < NLA_HEADER_LEN || offset + attr_len > len {
+            return;
+        }
+        let attr_type =
+            u16::from_ne_bytes(bytes[offset + 2..offset + 4].try_into().expect("NLA type"))
+                & NLA_TYPE_MASK;
+        let aligned = attr_len.next_multiple_of(4);
+        if offset + aligned > len {
+            return;
+        }
+        if attr_type == target {
+            bytes.copy_within(offset + aligned..len, offset);
+            // SAFETY: the header remains at the start of the same live buffer.
+            unsafe { (*header).nlmsg_len = (len - aligned) as u32 };
+            return;
+        }
+        offset += aligned;
+    }
+}
+
+/// Lookup expression for a named set that was created by an earlier transaction.
+pub(super) struct NamedLookup(CString);
+
+impl NamedLookup {
+    pub(super) fn new(name: &CStr) -> Self {
+        Self(name.to_owned())
+    }
+}
+
+impl Expression for NamedLookup {
+    fn to_expr(&self, _rule: &Rule) -> NonNull<sys::nftnl_expr> {
+        // SAFETY: allocation has no preconditions.
+        let expression = unsafe { sys::nftnl_expr_alloc(c"lookup".as_ptr()) };
+        let expression = NonNull::new(expression).unwrap_or_else(|| std::process::abort());
+        // SAFETY: the expression is live and uniquely owned; this initializes its source register.
+        unsafe {
+            sys::nftnl_expr_set_u32(
+                expression.as_ptr(),
+                sys::NFTNL_EXPR_LOOKUP_SREG as u16,
+                libc::NFT_REG_1 as u32,
+            );
+        }
+        // SAFETY: the expression and name are live, and libnftnl copies the name. Omitting SET_ID
+        // deliberately selects the persistent set by name.
+        unsafe {
+            sys::nftnl_expr_set_str(
+                expression.as_ptr(),
+                sys::NFTNL_EXPR_LOOKUP_SET as u16,
+                self.0.as_ptr(),
+            );
+        }
+        expression
     }
 }
 
@@ -191,35 +303,170 @@ impl SetElement {
     }
 }
 
-/// Netlink message that flushes every element from a named set.
-pub(super) struct SetFlush<'set, 'table, K> {
-    set: &'set Set<'table, K>,
+/// A rule deletion selector without a handle flushes every rule in the chain.
+pub(super) struct RuleFlush<'chain, 'table> {
+    chain: &'chain Chain<'table>,
 }
 
-impl<'set, 'table, K> SetFlush<'set, 'table, K> {
-    pub(super) fn new(set: &'set Set<'table, K>) -> Self {
-        Self { set }
+impl<'chain, 'table> RuleFlush<'chain, 'table> {
+    pub(super) fn new(chain: &'chain Chain<'table>) -> Self {
+        Self { chain }
     }
 }
 
-// SAFETY: `write` emits at most one nftables set-element message, which fits the maximum message
-// buffer guaranteed by `NlMsg`. The borrowed set remains alive for the duration of serialization.
-unsafe impl<K> NlMsg for SetFlush<'_, '_, K> {
+// SAFETY: serialization writes one bounded rule-delete message and all borrowed objects outlive it.
+#[allow(clippy::multiple_unsafe_ops_per_block)]
+unsafe impl NlMsg for RuleFlush<'_, '_> {
     unsafe fn write(&self, buffer: *mut c_void, seq: u32, _msg_type: MsgType) {
-        // SAFETY: The `NlMsg` caller guarantees that `buffer` is valid for the maximum nftables
-        // message size. libnftnl initializes and returns the header within that buffer.
-        let header = unsafe {
-            sys::nftnl_nlmsg_build_hdr(
+        // SAFETY: allocation has no preconditions and is checked before use.
+        let rule = unsafe { sys::nftnl_rule_alloc() };
+        if rule.is_null() {
+            std::process::abort();
+        }
+        // SAFETY: `rule` is live and uniquely owned, chain strings remain live through
+        // serialization, and the NlMsg contract provides a sufficiently large output buffer.
+        unsafe {
+            sys::nftnl_rule_set_u32(
+                rule,
+                sys::NFTNL_RULE_FAMILY as u16,
+                self.chain.get_table().get_family() as u32,
+            );
+            sys::nftnl_rule_set_str(
+                rule,
+                sys::NFTNL_RULE_TABLE as u16,
+                self.chain.get_table().get_name().as_ptr(),
+            );
+            sys::nftnl_rule_set_str(
+                rule,
+                sys::NFTNL_RULE_CHAIN as u16,
+                self.chain.get_name().as_ptr(),
+            );
+            let header = sys::nftnl_nlmsg_build_hdr(
                 buffer.cast::<c_char>(),
-                libc::NFT_MSG_DELSETELEM as u16,
+                libc::NFT_MSG_DELRULE as u16,
                 ProtoFamily::Inet as u16,
                 libc::NLM_F_ACK as u16,
                 seq,
-            )
+            );
+            sys::nftnl_rule_nlmsg_build_payload(header, rule);
+            sys::nftnl_rule_free(rule);
+        }
+    }
+}
+
+struct FreeTable;
+// SAFETY: `nftnl_table_free` matches pointers returned by `nftnl_table_alloc`.
+unsafe impl Deallocator<sys::nftnl_table> for FreeTable {
+    unsafe fn deallocate(&mut self, pointer: NonNull<sys::nftnl_table>) {
+        // SAFETY: guaranteed by the Deallocator contract.
+        unsafe { sys::nftnl_table_free(pointer.as_ptr()) };
+    }
+}
+
+pub(super) struct TableInfo(OwnedPtr<sys::nftnl_table, FreeTable>);
+impl TableInfo {
+    pub(super) fn parse(message: &libc::nlmsghdr) -> io::Result<Self> {
+        // SAFETY: allocation has no preconditions.
+        let pointer = unsafe { sys::nftnl_table_alloc() };
+        // SAFETY: a non-null pointer is uniquely owned and paired with FreeTable.
+        let pointer = unsafe { OwnedPtr::from_alloc(pointer, FreeTable, "table") }?;
+        let value = Self(pointer);
+        // SAFETY: the netlink message and destination table are live and bounded.
+        if unsafe { sys::nftnl_table_nlmsg_parse(message, value.0.pointer().as_ptr()) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(value)
+    }
+    pub(super) fn name(&self) -> io::Result<String> {
+        // SAFETY: the parsed table remains live for this borrowed attribute lookup.
+        let value = unsafe {
+            sys::nftnl_table_get_str(self.0.pointer().as_ptr(), sys::NFTNL_TABLE_NAME as u16)
         };
-        // SAFETY: `header` refers to the caller's valid output buffer, and `self.set` remains alive
-        // and contains no elements when used as a flush selector.
-        unsafe { sys::nftnl_set_elems_nlmsg_build_payload(header, self.set.as_ptr().as_ptr()) };
+        if value.is_null() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "table has no name",
+            ));
+        }
+        // SAFETY: libnftnl returns a NUL-terminated string owned by the live table.
+        Ok(unsafe { CStr::from_ptr(value) }
+            .to_string_lossy()
+            .into_owned())
+    }
+}
+
+struct FreeSet;
+// SAFETY: `nftnl_set_free` matches pointers returned by `nftnl_set_alloc`.
+unsafe impl Deallocator<sys::nftnl_set> for FreeSet {
+    unsafe fn deallocate(&mut self, pointer: NonNull<sys::nftnl_set>) {
+        // SAFETY: guaranteed by the Deallocator contract.
+        unsafe { sys::nftnl_set_free(pointer.as_ptr()) };
+    }
+}
+
+pub(super) struct SetInfo(OwnedPtr<sys::nftnl_set, FreeSet>);
+impl SetInfo {
+    pub(super) fn parse(message: &libc::nlmsghdr) -> io::Result<Self> {
+        // SAFETY: allocation has no preconditions.
+        let pointer = unsafe { sys::nftnl_set_alloc() };
+        // SAFETY: a non-null pointer is uniquely owned and paired with FreeSet.
+        let pointer = unsafe { OwnedPtr::from_alloc(pointer, FreeSet, "set") }?;
+        let value = Self(pointer);
+        // SAFETY: the netlink message and destination set are live and bounded.
+        if unsafe { sys::nftnl_set_nlmsg_parse(message, value.0.pointer().as_ptr()) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(value)
+    }
+    fn string(&self, attr: u32, label: &'static str) -> io::Result<String> {
+        // SAFETY: the parsed set remains live for this borrowed attribute lookup.
+        let value = unsafe { sys::nftnl_set_get_str(self.0.pointer().as_ptr(), attr as u16) };
+        if value.is_null() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("set has no {label}"),
+            ));
+        }
+        // SAFETY: libnftnl returns a NUL-terminated string owned by the live set.
+        Ok(unsafe { CStr::from_ptr(value) }
+            .to_string_lossy()
+            .into_owned())
+    }
+    pub(super) fn table(&self) -> io::Result<String> {
+        self.string(sys::NFTNL_SET_TABLE, "table")
+    }
+    pub(super) fn name(&self) -> io::Result<String> {
+        self.string(sys::NFTNL_SET_NAME, "name")
+    }
+    pub(super) fn count(message: &libc::nlmsghdr) -> Option<u32> {
+        const NFGENMSG_LEN: usize = 4;
+        const NLA_HEADER_LEN: usize = 4;
+        const NLA_TYPE_MASK: u16 = 0x3fff;
+        const NFTA_SET_COUNT: u16 = 19;
+        let len = message.nlmsg_len as usize;
+        if len < size_of::<libc::nlmsghdr>() + NFGENMSG_LEN {
+            return None;
+        }
+        // SAFETY: `nlmsg_len` bounds the live kernel-provided message containing this header.
+        let bytes = unsafe {
+            std::slice::from_raw_parts((message as *const libc::nlmsghdr).cast::<u8>(), len)
+        };
+        let mut offset = size_of::<libc::nlmsghdr>() + NFGENMSG_LEN;
+        while offset + NLA_HEADER_LEN <= bytes.len() {
+            let attr_len = u16::from_ne_bytes(bytes[offset..offset + 2].try_into().ok()?) as usize;
+            let attr_type =
+                u16::from_ne_bytes(bytes[offset + 2..offset + 4].try_into().ok()?) & NLA_TYPE_MASK;
+            if attr_len < NLA_HEADER_LEN || offset + attr_len > bytes.len() {
+                return None;
+            }
+            if attr_type == NFTA_SET_COUNT && attr_len >= NLA_HEADER_LEN + 4 {
+                return Some(u32::from_be_bytes(
+                    bytes[offset + 4..offset + 8].try_into().ok()?,
+                ));
+            }
+            offset += attr_len.next_multiple_of(4);
+        }
+        None
     }
 }
 
@@ -354,6 +601,38 @@ pub(super) struct NetlinkRequest {
 }
 
 impl NetlinkRequest {
+    fn dump(message_type: u16, seq: u32) -> io::Result<Self> {
+        let mut buffer = AlignedNetlinkBuffer::new(4096);
+        // SAFETY: the initialized aligned buffer is large enough for an empty dump request.
+        let header = unsafe {
+            sys::nftnl_nlmsg_build_hdr(
+                buffer.as_bytes_mut().as_mut_ptr().cast::<c_char>(),
+                message_type,
+                ProtoFamily::Unspec as u16,
+                (libc::NLM_F_REQUEST | libc::NLM_F_DUMP) as u16,
+                seq,
+            )
+        };
+        let header =
+            NonNull::new(header).ok_or_else(|| io::Error::other("null dump request header"))?;
+        // SAFETY: the header was checked non-null and points into the live request buffer.
+        let len = unsafe { header.as_ref().nlmsg_len as usize };
+        if len < size_of::<libc::nlmsghdr>() || len > buffer.capacity() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid dump request length",
+            ));
+        }
+        Ok(Self { buffer, len })
+    }
+
+    pub(super) fn table_dump(seq: u32) -> io::Result<Self> {
+        Self::dump(NFT_MSG_GETTABLE, seq)
+    }
+    pub(super) fn set_dump(seq: u32) -> io::Result<Self> {
+        Self::dump(NFT_MSG_GETSET, seq)
+    }
+
     pub(super) fn flowtable_dump(seq: u32) -> io::Result<Self> {
         let mut buffer = AlignedNetlinkBuffer::new(4096);
         // SAFETY: The buffer is initialized, aligned, and large enough for a netlink header and
@@ -442,11 +721,38 @@ mod tests {
         }
     }
 
+    struct FreeRule;
+
+    // SAFETY: `nftnl_rule_free` matches `nftnl_rule_alloc`.
+    unsafe impl Deallocator<sys::nftnl_rule> for FreeRule {
+        unsafe fn deallocate(&mut self, pointer: NonNull<sys::nftnl_rule>) {
+            // SAFETY: Guaranteed by the test fixture's allocation site.
+            unsafe { sys::nftnl_rule_free(pointer.as_ptr()) };
+        }
+    }
+
+    struct FreeExpressionIterator;
+
+    // SAFETY: `nftnl_expr_iter_destroy` matches `nftnl_expr_iter_create`.
+    unsafe impl Deallocator<sys::nftnl_expr_iter> for FreeExpressionIterator {
+        unsafe fn deallocate(&mut self, pointer: NonNull<sys::nftnl_expr_iter>) {
+            // SAFETY: Guaranteed by the test fixture's allocation site.
+            unsafe { sys::nftnl_expr_iter_destroy(pointer.as_ptr()) };
+        }
+    }
+
     fn allocate_test_set() -> OwnedPtr<sys::nftnl_set, FreeSet> {
         // SAFETY: Allocation has no preconditions.
         let pointer = unsafe { sys::nftnl_set_alloc() };
         // SAFETY: A non-null result is uniquely owned and paired with `nftnl_set_free`.
         unsafe { OwnedPtr::from_alloc(pointer, FreeSet, "test set") }.unwrap()
+    }
+
+    fn allocate_test_rule() -> OwnedPtr<sys::nftnl_rule, FreeRule> {
+        // SAFETY: Allocation has no preconditions.
+        let pointer = unsafe { sys::nftnl_rule_alloc() };
+        // SAFETY: A non-null result is uniquely owned and paired with `nftnl_rule_free`.
+        unsafe { OwnedPtr::from_alloc(pointer, FreeRule, "test rule") }.unwrap()
     }
 
     fn serialize<T: NlMsg>(message: &T, msg_type: MsgType, seq: u32) -> NetlinkRequest {
@@ -478,6 +784,61 @@ mod tests {
         ((libc::NFNL_SUBSYS_NFTABLES as u16) << 8) | message
     }
 
+    fn top_level_attributes(message: &[u8]) -> Vec<(u16, Vec<u8>)> {
+        const NFGENMSG_LEN: usize = 4;
+        const NLA_HEADER_LEN: usize = 4;
+        const NLA_TYPE_MASK: u16 = 0x3fff;
+        let mut attributes = Vec::new();
+        let mut offset = size_of::<libc::nlmsghdr>() + NFGENMSG_LEN;
+        while offset + NLA_HEADER_LEN <= message.len() {
+            let len = u16::from_ne_bytes(message[offset..offset + 2].try_into().unwrap()) as usize;
+            assert!(len >= NLA_HEADER_LEN);
+            assert!(offset + len <= message.len());
+            let attribute_type =
+                u16::from_ne_bytes(message[offset + 2..offset + 4].try_into().unwrap())
+                    & NLA_TYPE_MASK;
+            attributes.push((
+                attribute_type,
+                message[offset + NLA_HEADER_LEN..offset + len].to_vec(),
+            ));
+            offset += len.next_multiple_of(4);
+        }
+        assert_eq!(offset, message.len());
+        attributes
+    }
+
+    fn synthetic_message(attributes: &[(u16, &[u8])]) -> NetlinkRequest {
+        const NFGENMSG_LEN: usize = 4;
+        const NLA_HEADER_LEN: usize = 4;
+        let mut buffer = AlignedNetlinkBuffer::new(4096);
+        let mut len = size_of::<libc::nlmsghdr>() + NFGENMSG_LEN;
+        for (attribute_type, payload) in attributes {
+            let attribute_len = NLA_HEADER_LEN + payload.len();
+            let aligned_len = attribute_len.next_multiple_of(4);
+            let bytes = buffer.as_bytes_mut();
+            bytes[len..len + 2].copy_from_slice(&(attribute_len as u16).to_ne_bytes());
+            bytes[len + 2..len + 4].copy_from_slice(&attribute_type.to_ne_bytes());
+            bytes[len + NLA_HEADER_LEN..len + attribute_len].copy_from_slice(payload);
+            len += aligned_len;
+        }
+        let header = buffer.as_bytes_mut().as_mut_ptr().cast::<libc::nlmsghdr>();
+        // SAFETY: The aligned allocation contains a complete header and all attributes fit in it.
+        unsafe { (*header).nlmsg_len = len as u32 };
+        NetlinkRequest { buffer, len }
+    }
+
+    fn set_message_len(message: &mut NetlinkRequest, len: usize) {
+        assert!(len <= message.buffer.capacity());
+        let header = message
+            .buffer
+            .as_bytes_mut()
+            .as_mut_ptr()
+            .cast::<libc::nlmsghdr>();
+        // SAFETY: The buffer is aligned and contains a complete netlink header.
+        unsafe { (*header).nlmsg_len = len as u32 };
+        message.len = len;
+    }
+
     fn parse_set_definition(target: &OwnedPtr<sys::nftnl_set, FreeSet>, message: &NetlinkRequest) {
         // SAFETY: Both objects are live; the serialized message is aligned, bounded, and remains
         // borrowed for the call.
@@ -494,6 +855,22 @@ mod tests {
             sys::nftnl_set_elems_nlmsg_parse(header(message.as_bytes()), target.pointer().as_ptr())
         };
         assert_eq!(result, 0, "{}", io::Error::last_os_error());
+    }
+
+    fn parse_rule(target: &OwnedPtr<sys::nftnl_rule, FreeRule>, message: &NetlinkRequest) {
+        // SAFETY: Both objects are live; the serialized message is aligned and bounded.
+        let result = unsafe {
+            sys::nftnl_rule_nlmsg_parse(header(message.as_bytes()), target.pointer().as_ptr())
+        };
+        assert_eq!(result, 0, "{}", io::Error::last_os_error());
+    }
+
+    fn rule_string(rule: &OwnedPtr<sys::nftnl_rule, FreeRule>, attribute: u32) -> &CStr {
+        // SAFETY: The parsed rule is live and the fixture includes this string attribute.
+        let pointer = unsafe { sys::nftnl_rule_get_str(rule.pointer().as_ptr(), attribute as u16) };
+        assert!(!pointer.is_null());
+        // SAFETY: libnftnl owns a NUL-terminated string for the lifetime of `rule`.
+        unsafe { CStr::from_ptr(pointer) }
     }
 
     fn normalize_element_types_for_kernel_reply(message: &mut NetlinkRequest) {
@@ -808,6 +1185,121 @@ mod tests {
     }
 
     #[test]
+    fn top_level_attribute_removal_preserves_message_framing() {
+        let attributes: &[(u16, &[u8])] = &[(11, b"a"), (12, b"bc"), (13, b"def")];
+        for target in [11, 12, 13] {
+            let mut message = synthetic_message(attributes);
+            let original_len = message.len;
+            // SAFETY: `synthetic_message` created a complete, aligned, bounded netlink message.
+            unsafe {
+                remove_top_level_attribute(
+                    message.buffer.as_bytes_mut().as_mut_ptr().cast::<c_void>(),
+                    target,
+                )
+            };
+            message.len = header(message.buffer.as_bytes()).nlmsg_len as usize;
+            assert!(message.len < original_len);
+            assert_eq!(
+                top_level_attributes(message.as_bytes()),
+                attributes
+                    .iter()
+                    .filter(|(attribute_type, _)| *attribute_type != target)
+                    .map(|(attribute_type, payload)| (*attribute_type, payload.to_vec()))
+                    .collect::<Vec<_>>()
+            );
+        }
+
+        let mut absent = synthetic_message(attributes);
+        let before = absent.as_bytes().to_vec();
+        // SAFETY: `synthetic_message` created a complete, aligned, bounded netlink message.
+        unsafe {
+            remove_top_level_attribute(
+                absent.buffer.as_bytes_mut().as_mut_ptr().cast::<c_void>(),
+                99,
+            )
+        };
+        assert_eq!(absent.as_bytes(), before);
+    }
+
+    #[test]
+    fn top_level_attribute_removal_rejects_malformed_lengths() {
+        const ATTRIBUTE_OFFSET: usize = size_of::<libc::nlmsghdr>() + 4;
+
+        let mut undersized = synthetic_message(&[(11, b"a")]);
+        undersized.buffer.as_bytes_mut()[ATTRIBUTE_OFFSET..ATTRIBUTE_OFFSET + 2]
+            .copy_from_slice(&3u16.to_ne_bytes());
+        let before = undersized.as_bytes().to_vec();
+        // SAFETY: The backing allocation is still aligned and bounded despite the malformed NLA.
+        unsafe {
+            remove_top_level_attribute(
+                undersized
+                    .buffer
+                    .as_bytes_mut()
+                    .as_mut_ptr()
+                    .cast::<c_void>(),
+                11,
+            )
+        };
+        assert_eq!(undersized.as_bytes(), before);
+
+        let mut truncated = synthetic_message(&[(11, b"a")]);
+        set_message_len(&mut truncated, ATTRIBUTE_OFFSET + 5);
+        let before = truncated.as_bytes().to_vec();
+        // SAFETY: The claimed message length stays within the allocation; only NLA padding is
+        // deliberately missing.
+        unsafe {
+            remove_top_level_attribute(
+                truncated
+                    .buffer
+                    .as_bytes_mut()
+                    .as_mut_ptr()
+                    .cast::<c_void>(),
+                11,
+            )
+        };
+        assert_eq!(truncated.as_bytes(), before);
+
+        let mut oversized = synthetic_message(&[(11, b"a")]);
+        oversized.buffer.as_bytes_mut()[ATTRIBUTE_OFFSET..ATTRIBUTE_OFFSET + 2]
+            .copy_from_slice(&32u16.to_ne_bytes());
+        let before = oversized.as_bytes().to_vec();
+        // SAFETY: The malformed attribute length exceeds the message, not the backing allocation.
+        unsafe {
+            remove_top_level_attribute(
+                oversized
+                    .buffer
+                    .as_bytes_mut()
+                    .as_mut_ptr()
+                    .cast::<c_void>(),
+                11,
+            )
+        };
+        assert_eq!(oversized.as_bytes(), before);
+    }
+
+    #[test]
+    fn table_and_set_dump_requests_have_expected_headers() {
+        for (request, message_type, seq) in [
+            (
+                NetlinkRequest::table_dump(17).unwrap(),
+                NFT_MSG_GETTABLE,
+                17,
+            ),
+            (NetlinkRequest::set_dump(23).unwrap(), NFT_MSG_GETSET, 23),
+        ] {
+            let header = header(request.as_bytes());
+            assert_eq!(header.nlmsg_type, nft_message_type(message_type));
+            assert_eq!(header.nlmsg_seq, seq);
+            assert_ne!(header.nlmsg_flags & libc::NLM_F_REQUEST as u16, 0);
+            assert_ne!(header.nlmsg_flags & libc::NLM_F_DUMP as u16, 0);
+            assert_eq!(
+                request.as_bytes()[size_of::<libc::nlmsghdr>()],
+                ProtoFamily::Unspec as u8
+            );
+        }
+    }
+
+    #[test]
     fn flowtable_request_is_bounded_and_contains_a_header() {
         let request = NetlinkRequest::flowtable_dump(7).unwrap();
         assert!(request.as_bytes().len() >= size_of::<libc::nlmsghdr>());
@@ -821,6 +1313,52 @@ mod tests {
             request.as_bytes()[size_of::<libc::nlmsghdr>()],
             ProtoFamily::Unspec as u8
         );
+    }
+
+    #[test]
+    fn table_and_set_info_round_trip_through_libnftnl() {
+        let table = Table::new(c"metadata", ProtoFamily::Inet);
+        let table_message = serialize(&table, MsgType::Add, 31);
+        let parsed_table = TableInfo::parse(header(table_message.as_bytes())).unwrap();
+        assert_eq!(parsed_table.name().unwrap(), "metadata");
+
+        let set = IntervalSet::<Ipv4Addr>::new(c"addresses", 37, &table);
+        let set_message = serialize(set.as_set(), MsgType::Add, 32);
+        let parsed_set = SetInfo::parse(header(set_message.as_bytes())).unwrap();
+        assert_eq!(parsed_set.table().unwrap(), "metadata");
+        assert_eq!(parsed_set.name().unwrap(), "addresses");
+        assert_eq!(SetInfo::count(header(set_message.as_bytes())), None);
+    }
+
+    #[test]
+    fn set_count_parses_valid_and_missing_attributes() {
+        let count = synthetic_message(&[(7, b"ignored"), (19, &4_228_762u32.to_be_bytes())]);
+        assert_eq!(SetInfo::count(header(count.as_bytes())), Some(4_228_762));
+
+        let missing = synthetic_message(&[(7, b"ignored")]);
+        assert_eq!(SetInfo::count(header(missing.as_bytes())), None);
+
+        let short_count = synthetic_message(&[(19, &[0, 1, 2])]);
+        assert_eq!(SetInfo::count(header(short_count.as_bytes())), None);
+    }
+
+    #[test]
+    fn set_count_rejects_malformed_messages() {
+        const ATTRIBUTE_OFFSET: usize = size_of::<libc::nlmsghdr>() + 4;
+
+        let mut too_short = synthetic_message(&[]);
+        set_message_len(&mut too_short, size_of::<libc::nlmsghdr>());
+        assert_eq!(SetInfo::count(header(too_short.as_bytes())), None);
+
+        let mut undersized = synthetic_message(&[(19, &1u32.to_be_bytes())]);
+        undersized.buffer.as_bytes_mut()[ATTRIBUTE_OFFSET..ATTRIBUTE_OFFSET + 2]
+            .copy_from_slice(&3u16.to_ne_bytes());
+        assert_eq!(SetInfo::count(header(undersized.as_bytes())), None);
+
+        let mut truncated = synthetic_message(&[(19, &1u32.to_be_bytes())]);
+        truncated.buffer.as_bytes_mut()[ATTRIBUTE_OFFSET..ATTRIBUTE_OFFSET + 2]
+            .copy_from_slice(&12u16.to_ne_bytes());
+        assert_eq!(SetInfo::count(header(truncated.as_bytes())), None);
     }
 
     #[test]
@@ -848,23 +1386,182 @@ mod tests {
     }
 
     #[test]
-    fn set_flush_round_trips_as_an_empty_delete_selector() {
+    fn existing_set_element_messages_omit_transaction_local_id() {
         let table = Table::new(c"roundtrip", ProtoFamily::Inet);
-        let selector = IntervalSet::<Ipv4Addr>::new(c"addresses", 73, &table);
-        let message = serialize(&SetFlush::new(selector.as_set()), MsgType::Del, 71);
-        let header = header(message.as_bytes());
-        assert_eq!(
-            header.nlmsg_type,
-            nft_message_type(libc::NFT_MSG_DELSETELEM as u16)
+        let mut source = IntervalSet::<Ipv4Addr>::existing(c"addresses", &table);
+        source
+            .add_range(
+                &"10.0.0.0".parse().unwrap(),
+                Some(&"10.0.0.1".parse().unwrap()),
+            )
+            .unwrap();
+        let mut iterator = source.as_set().elems_iter();
+        let element_message = iterator.next().unwrap();
+        let message = serialize(&ExistingElements::new(element_message), MsgType::Add, 70);
+        const NFGENMSG_LEN: usize = 4;
+        const NLA_HEADER_LEN: usize = 4;
+        let bytes = message.as_bytes();
+        let mut offset = size_of::<libc::nlmsghdr>() + NFGENMSG_LEN;
+        let mut types = Vec::new();
+        while offset + NLA_HEADER_LEN <= bytes.len() {
+            let len = u16::from_ne_bytes(bytes[offset..offset + 2].try_into().unwrap()) as usize;
+            types.push(
+                u16::from_ne_bytes(bytes[offset + 2..offset + 4].try_into().unwrap()) & 0x3fff,
+            );
+            offset += len.next_multiple_of(4);
+        }
+        assert!(!types.contains(&4), "set-list ID was retained: {types:?}");
+        assert!(types.contains(&2), "set name is missing: {types:?}");
+    }
+
+    #[test]
+    fn every_existing_set_element_message_omits_transaction_local_id() {
+        let table = Table::new(c"roundtrip", ProtoFamily::Inet);
+        let mut source = IntervalSet::<Ipv4Addr>::existing(c"addresses", &table);
+        for value in 0..5_000u32 {
+            source
+                .add_range(
+                    &Ipv4Addr::from(value * 2),
+                    Some(&Ipv4Addr::from(value * 2 + 1)),
+                )
+                .unwrap();
+        }
+
+        let mut message_count = 0;
+        for elements in source.as_set().elems_iter() {
+            let message = serialize(&ExistingElements::new(elements), MsgType::Add, 71);
+            let types: Vec<_> = top_level_attributes(message.as_bytes())
+                .into_iter()
+                .map(|(attribute_type, _)| attribute_type)
+                .collect();
+            assert!(!types.contains(&4), "set-list ID was retained: {types:?}");
+            assert!(types.contains(&2), "set name is missing: {types:?}");
+            message_count += 1;
+        }
+        assert!(message_count > 1);
+    }
+
+    #[test]
+    fn existing_set_message_omits_id_and_preserves_selector() {
+        let table = Table::new(c"roundtrip", ProtoFamily::Inet);
+        let source = IntervalSet::<Ipv4Addr>::existing(c"addresses", &table);
+        let raw = serialize(source.as_set(), MsgType::Del, 72);
+        assert!(
+            top_level_attributes(raw.as_bytes())
+                .iter()
+                .any(|(attribute_type, _)| *attribute_type == 10),
+            "fixture did not contain a transaction-local set ID"
         );
-        assert_eq!(header.nlmsg_seq, 71);
-        assert_ne!(header.nlmsg_flags & libc::NLM_F_ACK as u16, 0);
+
+        let message = serialize(&ExistingSetMessage::new(source.as_set()), MsgType::Del, 73);
+        let message_header = header(message.as_bytes());
+        assert_eq!(
+            message_header.nlmsg_type,
+            nft_message_type(libc::NFT_MSG_DELSET as u16)
+        );
+        assert_eq!(message_header.nlmsg_seq, 73);
+        assert_ne!(message_header.nlmsg_flags & libc::NLM_F_ACK as u16, 0);
+        let types: Vec<_> = top_level_attributes(message.as_bytes())
+            .into_iter()
+            .map(|(attribute_type, _)| attribute_type)
+            .collect();
+        assert!(!types.contains(&10), "set ID was retained: {types:?}");
+        assert!(types.contains(&1), "table name is missing: {types:?}");
+        assert!(types.contains(&2), "set name is missing: {types:?}");
 
         let parsed = allocate_test_set();
-        parse_set_elements(&parsed, &message);
+        parse_set_definition(&parsed, &message);
         assert_eq!(set_string(&parsed, sys::NFTNL_SET_TABLE), c"roundtrip");
         assert_eq!(set_string(&parsed, sys::NFTNL_SET_NAME), c"addresses");
-        assert!(set_elements(&parsed).is_empty());
+        // SAFETY: The parsed set remains live for this attribute-presence query.
+        assert!(!unsafe {
+            sys::nftnl_set_is_set(parsed.pointer().as_ptr(), sys::NFTNL_SET_ID as u16)
+        });
+    }
+
+    #[test]
+    fn named_lookup_round_trips_without_a_set_id() {
+        let table = Table::new(c"roundtrip", ProtoFamily::Inet);
+        let chain = Chain::new(c"input", &table);
+        let mut source = Rule::new(&chain);
+        source.add_expr(&NamedLookup::new(c"addresses"));
+        let message = serialize(&source, MsgType::Add, 74);
+        let parsed = allocate_test_rule();
+        parse_rule(&parsed, &message);
+
+        // SAFETY: The parsed rule remains live for the iterator's lifetime.
+        let iterator = unsafe { sys::nftnl_expr_iter_create(parsed.pointer().as_ptr()) };
+        // SAFETY: A non-null result is uniquely owned and paired with the iterator destroy call.
+        let iterator = unsafe {
+            OwnedPtr::from_alloc(iterator, FreeExpressionIterator, "test expression iterator")
+        }
+        .unwrap();
+        // SAFETY: The iterator and its underlying parsed rule are live.
+        let expression = unsafe { sys::nftnl_expr_iter_next(iterator.pointer().as_ptr()) };
+        let expression = NonNull::new(expression).expect("lookup expression is missing");
+        // SAFETY: The expression is live for these attribute-presence queries.
+        let has_source_register = unsafe {
+            sys::nftnl_expr_is_set(expression.as_ptr(), sys::NFTNL_EXPR_LOOKUP_SREG as u16)
+        };
+        assert!(has_source_register);
+        // SAFETY: The expression is live and the source-register attribute is present.
+        let source_register = unsafe {
+            sys::nftnl_expr_get_u32(expression.as_ptr(), sys::NFTNL_EXPR_LOOKUP_SREG as u16)
+        };
+        assert_eq!(source_register, libc::NFT_REG_1 as u32);
+        // SAFETY: The expression is live for this attribute-presence query.
+        let has_set_name = unsafe {
+            sys::nftnl_expr_is_set(expression.as_ptr(), sys::NFTNL_EXPR_LOOKUP_SET as u16)
+        };
+        assert!(has_set_name);
+        // SAFETY: The expression is live and the set-name attribute is present.
+        let set_name = unsafe {
+            sys::nftnl_expr_get_str(expression.as_ptr(), sys::NFTNL_EXPR_LOOKUP_SET as u16)
+        };
+        assert!(!set_name.is_null());
+        // SAFETY: libnftnl returned a NUL-terminated string owned by the live expression.
+        assert_eq!(unsafe { CStr::from_ptr(set_name) }, c"addresses");
+        // SAFETY: The expression is live for this attribute-presence query.
+        let has_set_id = unsafe {
+            sys::nftnl_expr_is_set(expression.as_ptr(), sys::NFTNL_EXPR_LOOKUP_SET_ID as u16)
+        };
+        assert!(!has_set_id);
+        // SAFETY: The iterator and its underlying parsed rule remain live.
+        let next = unsafe { sys::nftnl_expr_iter_next(iterator.pointer().as_ptr()) };
+        assert!(next.is_null());
+    }
+
+    #[test]
+    fn rule_flush_serializes_a_handle_free_chain_selector() {
+        let table = Table::new(c"roundtrip", ProtoFamily::Inet);
+        let chain = Chain::new(c"input", &table);
+        let message = serialize(&RuleFlush::new(&chain), MsgType::Del, 75);
+        let message_header = header(message.as_bytes());
+        assert_eq!(
+            message_header.nlmsg_type,
+            nft_message_type(libc::NFT_MSG_DELRULE as u16)
+        );
+        assert_eq!(message_header.nlmsg_seq, 75);
+        assert_eq!(
+            message_header.nlmsg_flags,
+            (libc::NLM_F_REQUEST | libc::NLM_F_ACK) as u16,
+            "flush should request only the deletion and its acknowledgement"
+        );
+
+        let parsed = allocate_test_rule();
+        parse_rule(&parsed, &message);
+        assert_eq!(rule_string(&parsed, sys::NFTNL_RULE_TABLE), c"roundtrip");
+        assert_eq!(rule_string(&parsed, sys::NFTNL_RULE_CHAIN), c"input");
+        // SAFETY: The parsed rule remains live and contains the family attribute.
+        let family = unsafe {
+            sys::nftnl_rule_get_u32(parsed.pointer().as_ptr(), sys::NFTNL_RULE_FAMILY as u16)
+        };
+        assert_eq!(family, ProtoFamily::Inet as u32);
+        // SAFETY: The parsed rule remains live for this attribute-presence query.
+        let has_handle = unsafe {
+            sys::nftnl_rule_is_set(parsed.pointer().as_ptr(), sys::NFTNL_RULE_HANDLE as u16)
+        };
+        assert!(!has_handle);
     }
 
     #[test]

@@ -75,6 +75,7 @@ inbound = "$TMP/inbound.txt"
 outbound = "$TMP/outbound.txt"
 [nftables]
 allow_flowtable_bypass = false
+populate_batch_elements = 2
 [[rules.input]]
 blocklist = "inbound"
 ingress_zones = ["WAN"]
@@ -110,7 +111,7 @@ if ip netns exec "$ROUTER" ping -c 1 -W 1 198.51.100.2 >/dev/null 2>&1; then exi
 if ip netns exec "$LAN" ping -c 1 -W 1 198.51.100.2 >/dev/null 2>&1; then exit 1; fi
 
 # An invalid atomic replacement must retain the active inbound set.
-printf '%s\n' 'not-a-cidr' >"$TMP/.inbound.tmp"
+printf '%s\n' '192.0.2.2/32' '192.0.2.4/32' 'not-a-cidr' >"$TMP/.inbound.tmp"
 mv "$TMP/.inbound.tmp" "$TMP/inbound.txt"
 sleep 1
 if ip netns exec "$WAN" ping -c 1 -W 1 192.0.2.1 >/dev/null 2>&1; then exit 1; fi
@@ -130,6 +131,18 @@ kill -TERM "$PID"
 wait "$PID"
 PID=""
 ip netns exec "$ROUTER" nft list table inet nftblock >/dev/null
+
+# A pre-generation table is incompatible and must remain untouched.
+ip netns exec "$ROUTER" nft delete table inet nftblock
+ip netns exec "$ROUTER" nft add table inet nftblock
+ip netns exec "$ROUTER" nft 'add set inet nftblock inbound_v4 { type ipv4_addr; flags interval; }'
+if ip netns exec "$ROUTER" "$BIN" --config "$TMP/nftblock.toml" >"$TMP/legacy-log" 2>&1; then
+    echo "daemon accepted a pre-generation table" >&2
+    exit 1
+fi
+grep -q 'unsupported pre-generation layout' "$TMP/legacy-log"
+ip netns exec "$ROUTER" nft list set inet nftblock inbound_v4 >/dev/null
+ip netns exec "$ROUTER" nft delete table inet nftblock
 
 # A protected flowtable must make startup fail closed.
 ip netns exec "$ROUTER" nft add table inet flowtest
