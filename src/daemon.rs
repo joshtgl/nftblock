@@ -346,7 +346,7 @@ impl<B: Backend> Daemon<B> {
                 }
             }
             if now >= next_reconcile {
-                log::info!(
+                log::debug!(
                     "reconciliation triggered: reason=periodic interval_secs={}",
                     self.config.runtime.reconcile_secs
                 );
@@ -391,8 +391,8 @@ impl<B: Backend> Daemon<B> {
             Health::Healthy => {
                 self.backend
                     .repair_rules(&self.config, &self.rules, &active)?;
-                log::info!(
-                    "reconciliation complete: generation sets healthy; rules_repaired=true sets_repopulated=false inbound_ipv4_set={} inbound_ipv6_set={} outbound_ipv4_set={} outbound_ipv6_set={}",
+                log::debug!(
+                    "reconciliation complete: generation sets healthy; rules_refreshed=true sets_repopulated=false inbound_ipv4_set={} inbound_ipv6_set={} outbound_ipv4_set={} outbound_ipv6_set={}",
                     active.inbound.ipv4_set,
                     active.inbound.ipv6_set,
                     active.outbound.ipv4_set,
