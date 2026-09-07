@@ -132,6 +132,38 @@ wait "$PID"
 PID=""
 ip netns exec "$ROUTER" nft list table inet nftblock >/dev/null
 
+# An unreferenced outbound blocklist may be omitted and creates no outbound generation sets.
+ip netns exec "$ROUTER" nft delete table inet nftblock
+printf '%s\n' '192.0.2.2/32' >"$TMP/inbound.txt"
+cat >"$TMP/inbound-only.toml" <<EOF
+[files]
+zones = "$TMP/zones.json"
+inbound = "$TMP/inbound.txt"
+[nftables]
+allow_flowtable_bypass = false
+populate_batch_elements = 2
+[[rules.input]]
+blocklist = "inbound"
+ingress_zones = ["WAN"]
+EOF
+ip netns exec "$ROUTER" "$BIN" --config "$TMP/inbound-only.toml" >"$TMP/inbound-only-log" 2>&1 &
+PID=$!
+tries=0
+until ip netns exec "$ROUTER" nft list table inet nftblock >/dev/null 2>&1; do
+    tries=$((tries + 1))
+    if [ "$tries" -gt 50 ]; then cat "$TMP/inbound-only-log" >&2; exit 1; fi
+    sleep 0.1
+done
+if ip netns exec "$WAN" ping -c 1 -W 1 192.0.2.1 >/dev/null 2>&1; then exit 1; fi
+ip netns exec "$ROUTER" ping -c 1 -W 1 198.51.100.2 >/dev/null
+if ip netns exec "$ROUTER" nft list sets inet nftblock | grep -q 'out_.*_g'; then
+    echo "inbound-only configuration created outbound generation sets" >&2
+    exit 1
+fi
+kill -TERM "$PID"
+wait "$PID"
+PID=""
+
 # A pre-generation table is incompatible and must remain untouched.
 ip netns exec "$ROUTER" nft delete table inet nftblock
 ip netns exec "$ROUTER" nft add table inet nftblock

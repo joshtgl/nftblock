@@ -32,6 +32,12 @@ fields are rejected before netlink is opened. Flowtables are queried directly ov
 contains any protected interface, startup/reconciliation fails unless
 `allow_flowtable_bypass = true` is explicitly set.
 
+`[files].inbound` and `[files].outbound` are optional when no rule mapping references the
+corresponding blocklist. A referenced direction must have a configured path, and a configured path
+must exist when that direction is loaded. Unused directions are not staged, watched, or
+reconciled. An explicitly configured empty file remains valid and activates empty IPv4/IPv6 sets
+for that direction.
+
 All file paths, table settings, timing settings, and the flowtable override have CLI flags and
 `NFTBLOCK_*` environment overrides. Use `nftblock --help` for their exact names. Validate and show
 the expanded mappings without changing the firewall:

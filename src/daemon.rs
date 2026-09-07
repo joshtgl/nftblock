@@ -66,11 +66,15 @@ impl<B: Backend> Daemon<B> {
             ),
         }
         self.replace_both("startup")
-            .context("startup could not activate and verify both blocklists")
+            .context("startup could not activate and verify configured blocklists")
     }
 
     fn stage(&mut self, direction: Direction, reason: &str) -> Result<DirectionGeneration> {
-        let path = self.path(direction).to_path_buf();
+        let path = self
+            .config
+            .blocklist_path(direction)
+            .with_context(|| format!("{} blocklist is not configured", direction.name()))?
+            .to_path_buf();
         let reader = open_blocklist(&path)?;
         let mut stage = self.backend.begin_stage(&self.config, direction)?;
         log::info!(
@@ -119,10 +123,15 @@ impl<B: Backend> Daemon<B> {
     }
 
     fn replace_both(&mut self, reason: &str) -> Result<()> {
+        let directions: Vec<_> = [Direction::Inbound, Direction::Outbound]
+            .into_iter()
+            .filter(|direction| self.config.uses(*direction))
+            .collect();
         if self.active.is_some() {
             log::info!("sequential blocklist replacement triggered: reason={reason}");
-            self.reload_for(Direction::Inbound, reason)?;
-            self.reload_for(Direction::Outbound, reason)?;
+            for direction in directions {
+                self.reload_for(direction, reason)?;
+            }
             let active = self
                 .active
                 .clone()
@@ -130,27 +139,42 @@ impl<B: Backend> Daemon<B> {
             self.verify_candidate(&active, None, reason)?;
             log::info!(
                 "sequential blocklist replacement complete: reason={reason} inbound_ipv4_set={} inbound_ipv6_set={} outbound_ipv4_set={} outbound_ipv6_set={}",
-                active.inbound.ipv4_set,
-                active.inbound.ipv6_set,
-                active.outbound.ipv4_set,
-                active.outbound.ipv6_set
+                active
+                    .inbound
+                    .as_ref()
+                    .map_or("disabled", |value| value.ipv4_set.as_str()),
+                active
+                    .inbound
+                    .as_ref()
+                    .map_or("disabled", |value| value.ipv6_set.as_str()),
+                active
+                    .outbound
+                    .as_ref()
+                    .map_or("disabled", |value| value.ipv4_set.as_str()),
+                active
+                    .outbound
+                    .as_ref()
+                    .map_or("disabled", |value| value.ipv6_set.as_str()),
             );
             return Ok(());
         }
 
-        let inbound = self.stage(Direction::Inbound, reason)?;
-        let outbound = match self.stage(Direction::Outbound, reason) {
-            Ok(value) => value,
-            Err(error) => {
-                if let Err(cleanup) = self.backend.discard(&self.config, &inbound) {
-                    log::error!("failed to discard inbound staging sets: {cleanup}");
+        let mut candidate = ActiveGenerations::default();
+        for direction in directions {
+            match self.stage(direction, reason) {
+                Ok(stage) => candidate.set(direction, stage),
+                Err(error) => {
+                    for stage in candidate.iter() {
+                        if let Err(cleanup) = self.backend.discard(&self.config, stage) {
+                            log::error!("failed to discard staging sets: {cleanup}");
+                        }
+                    }
+                    return Err(error);
                 }
-                return Err(error);
             }
-        };
-        let candidate = ActiveGenerations { inbound, outbound };
+        }
         if let Err(error) = self.verify_candidate(&candidate, None, reason) {
-            for stage in [&candidate.inbound, &candidate.outbound] {
+            for stage in candidate.iter() {
                 if let Err(cleanup) = self.backend.discard(&self.config, stage) {
                     log::error!("failed to discard unhealthy staging sets: {cleanup}");
                 }
@@ -161,7 +185,7 @@ impl<B: Backend> Daemon<B> {
             .backend
             .activate_initial(&self.config, &self.rules, &candidate)
         {
-            for stage in [&candidate.inbound, &candidate.outbound] {
+            for stage in candidate.iter() {
                 if let Err(cleanup) = self.backend.discard(&self.config, stage) {
                     log::error!("failed to discard unactivated staging sets: {cleanup}");
                 }
@@ -177,14 +201,38 @@ impl<B: Backend> Daemon<B> {
         }
         log::info!(
             "activated blocklist generations: reason={reason} inbound_ipv4_set={} inbound_ipv4_boundary_elements={} inbound_ipv6_set={} inbound_ipv6_boundary_elements={} outbound_ipv4_set={} outbound_ipv4_boundary_elements={} outbound_ipv6_set={} outbound_ipv6_boundary_elements={}",
-            candidate.inbound.ipv4_set,
-            candidate.inbound.ipv4_boundaries,
-            candidate.inbound.ipv6_set,
-            candidate.inbound.ipv6_boundaries,
-            candidate.outbound.ipv4_set,
-            candidate.outbound.ipv4_boundaries,
-            candidate.outbound.ipv6_set,
-            candidate.outbound.ipv6_boundaries
+            candidate
+                .inbound
+                .as_ref()
+                .map_or("disabled", |value| value.ipv4_set.as_str()),
+            candidate
+                .inbound
+                .as_ref()
+                .map_or(0, |value| value.ipv4_boundaries),
+            candidate
+                .inbound
+                .as_ref()
+                .map_or("disabled", |value| value.ipv6_set.as_str()),
+            candidate
+                .inbound
+                .as_ref()
+                .map_or(0, |value| value.ipv6_boundaries),
+            candidate
+                .outbound
+                .as_ref()
+                .map_or("disabled", |value| value.ipv4_set.as_str()),
+            candidate
+                .outbound
+                .as_ref()
+                .map_or(0, |value| value.ipv4_boundaries),
+            candidate
+                .outbound
+                .as_ref()
+                .map_or("disabled", |value| value.ipv6_set.as_str()),
+            candidate
+                .outbound
+                .as_ref()
+                .map_or(0, |value| value.ipv6_boundaries),
         );
         Ok(())
     }
@@ -194,6 +242,12 @@ impl<B: Backend> Daemon<B> {
     }
 
     fn reload_for(&mut self, direction: Direction, reason: &str) -> Result<()> {
+        if !self.config.uses(direction) {
+            bail!(
+                "{} blocklist is not configured or referenced",
+                direction.name()
+            );
+        }
         if self.active.is_none() {
             return self.replace_both(reason);
         }
@@ -203,10 +257,7 @@ impl<B: Backend> Daemon<B> {
         );
         let stage = self.stage(direction, reason)?;
         let mut candidate = self.active.clone().expect("checked active state");
-        match direction {
-            Direction::Inbound => candidate.inbound = stage.clone(),
-            Direction::Outbound => candidate.outbound = stage.clone(),
-        }
+        candidate.set(direction, stage.clone());
         if let Err(error) = self.verify_candidate(&candidate, Some(direction), reason) {
             if let Err(cleanup) = self.backend.discard(&self.config, &stage) {
                 log::error!("failed to discard unhealthy staging sets: {cleanup}");
@@ -230,10 +281,9 @@ impl<B: Backend> Daemon<B> {
             ),
             Err(error) => log::error!("obsolete generation cleanup deferred: {error}"),
         }
-        let generation = match direction {
-            Direction::Inbound => &candidate.inbound,
-            Direction::Outbound => &candidate.outbound,
-        };
+        let generation = candidate
+            .get(direction)
+            .expect("activated direction is present in candidate");
         log::info!(
             "activated blocklist generation: reason={reason} direction={} ipv4_set={} ipv4_set_elements={} ipv4_boundary_elements={} ipv6_set={} ipv6_set_elements={} ipv6_boundary_elements={}",
             direction_name(direction),
@@ -265,16 +315,8 @@ impl<B: Backend> Daemon<B> {
         };
         if !candidate_is_healthy {
             bail!(
-                "staged {} blocklist failed immediate health verification: health={health:?} inbound_ipv4_set={} inbound_ipv4_expected_elements={} inbound_ipv6_set={} inbound_ipv6_expected_elements={} outbound_ipv4_set={} outbound_ipv4_expected_elements={} outbound_ipv6_set={} outbound_ipv6_expected_elements={}",
+                "staged {} blocklist failed immediate health verification: health={health:?} candidate={candidate:?}",
                 replaced.map(direction_name).unwrap_or("combined"),
-                candidate.inbound.ipv4_set,
-                candidate.inbound.ipv4_intervals,
-                candidate.inbound.ipv6_set,
-                candidate.inbound.ipv6_intervals,
-                candidate.outbound.ipv4_set,
-                candidate.outbound.ipv4_intervals,
-                candidate.outbound.ipv6_set,
-                candidate.outbound.ipv6_intervals
             );
         }
         log::info!(
@@ -284,24 +326,18 @@ impl<B: Backend> Daemon<B> {
         Ok(())
     }
 
-    fn path(&self, direction: Direction) -> &Path {
-        match direction {
-            Direction::Inbound => &self.config.files.inbound,
-            Direction::Outbound => &self.config.files.outbound,
-        }
-    }
-
     fn watch(&mut self) -> Result<()> {
         let (tx, rx) = mpsc::channel();
         let mut watcher: RecommendedWatcher = notify::recommended_watcher(move |event| {
             let _ = tx.send(event);
         })?;
-        let parents = [
-            self.config.files.inbound.parent(),
-            self.config.files.outbound.parent(),
-        ];
         let mut watched = BTreeSet::new();
-        for parent in parents.into_iter().flatten() {
+        for parent in [Direction::Inbound, Direction::Outbound]
+            .into_iter()
+            .filter(|direction| self.config.uses(*direction))
+            .filter_map(|direction| self.config.blocklist_path(direction))
+            .filter_map(Path::parent)
+        {
             if watched.insert(parent.to_path_buf()) {
                 watcher.watch(parent, RecursiveMode::NonRecursive)?;
             }
@@ -321,8 +357,8 @@ impl<B: Backend> Daemon<B> {
                 Ok(Ok(event)) => {
                     for direction in classify_event(
                         &event,
-                        &self.config.files.inbound,
-                        &self.config.files.outbound,
+                        self.config.blocklist_path(Direction::Inbound),
+                        self.config.blocklist_path(Direction::Outbound),
                     ) {
                         pending.insert(direction, Instant::now() + self.config.debounce());
                     }
@@ -392,11 +428,7 @@ impl<B: Backend> Daemon<B> {
                 self.backend
                     .repair_rules(&self.config, &self.rules, &active)?;
                 log::debug!(
-                    "reconciliation complete: generation sets healthy; rules_refreshed=true sets_repopulated=false inbound_ipv4_set={} inbound_ipv6_set={} outbound_ipv4_set={} outbound_ipv6_set={}",
-                    active.inbound.ipv4_set,
-                    active.inbound.ipv6_set,
-                    active.outbound.ipv4_set,
-                    active.outbound.ipv6_set
+                    "reconciliation complete: generation sets healthy; rules_refreshed=true sets_repopulated=false active={active:?}"
                 );
             }
             Health::InboundDamaged => self.reload_for(
@@ -440,16 +472,20 @@ fn check_flowtables<B: Backend>(
     Ok(())
 }
 
-pub fn classify_event(event: &Event, inbound: &Path, outbound: &Path) -> BTreeSet<Direction> {
+pub fn classify_event(
+    event: &Event,
+    inbound: Option<&Path>,
+    outbound: Option<&Path>,
+) -> BTreeSet<Direction> {
     let mut found = BTreeSet::new();
     if matches!(event.kind, notify::EventKind::Access(_)) {
         return found;
     }
     for path in &event.paths {
-        if same_target(path, inbound) {
+        if inbound.is_some_and(|target| same_target(path, target)) {
             found.insert(Direction::Inbound);
         }
-        if same_target(path, outbound) {
+        if outbound.is_some_and(|target| same_target(path, target)) {
             found.insert(Direction::Outbound);
         }
     }
@@ -479,8 +515,8 @@ mod tests {
         Config {
             files: Files {
                 zones: Some(root.join("zones.json")),
-                inbound: root.join("inbound.txt"),
-                outbound: root.join("outbound.txt"),
+                inbound: Some(root.join("inbound.txt")),
+                outbound: Some(root.join("outbound.txt")),
             },
             zones: None,
             nftables: Nftables::default(),
@@ -492,9 +528,17 @@ mod tests {
                     egress_zones: vec![],
                 }],
                 forward: vec![],
-                output: vec![],
+                output: vec![RuleMapping {
+                    blocklist: Direction::Outbound,
+                    ingress_zones: vec![],
+                    egress_zones: vec![],
+                }],
             },
         }
+    }
+
+    fn path(config: &Config, direction: Direction) -> &Path {
+        config.blocklist_path(direction).unwrap()
     }
 
     #[test]
@@ -510,8 +554,8 @@ mod tests {
         assert!(
             classify_event(
                 &event,
-                Path::new("/lists/inbound.txt"),
-                Path::new("/lists/outbound.txt")
+                Some(Path::new("/lists/inbound.txt")),
+                Some(Path::new("/lists/outbound.txt"))
             )
             .contains(&Direction::Inbound)
         );
@@ -529,23 +573,74 @@ mod tests {
         assert!(
             classify_event(
                 &event,
-                Path::new("/lists/inbound.txt"),
-                Path::new("/lists/outbound.txt")
+                Some(Path::new("/lists/inbound.txt")),
+                Some(Path::new("/lists/outbound.txt"))
             )
             .is_empty()
         );
     }
 
     #[test]
+    fn ignores_events_for_an_unconfigured_direction() {
+        let event = Event {
+            kind: EventKind::Modify(ModifyKind::Data(notify::event::DataChange::Any)),
+            paths: vec![PathBuf::from("/lists/outbound.txt")],
+            attrs: Default::default(),
+        };
+
+        assert!(classify_event(&event, Some(Path::new("/lists/inbound.txt")), None,).is_empty());
+    }
+
+    #[test]
+    fn stages_only_referenced_directions() {
+        let root = tempfile::tempdir().unwrap();
+        let mut cfg = config(root.path());
+        cfg.files.outbound = None;
+        cfg.rules.output.clear();
+        fs::write(path(&cfg, Direction::Inbound), "10.0.0.0/8\n").unwrap();
+        cfg.validate().unwrap();
+
+        let mut daemon = Daemon::new(cfg, MemoryBackend::default()).unwrap();
+        daemon.initial_load().unwrap();
+
+        let active = daemon.active.as_ref().unwrap();
+        assert!(active.inbound.is_some());
+        assert!(active.outbound.is_none());
+        assert_eq!(daemon.backend.generation, 1);
+        assert!(daemon.reload(Direction::Outbound).is_err());
+    }
+
+    #[test]
+    fn accepts_an_explicitly_empty_blocklist() {
+        let root = tempfile::tempdir().unwrap();
+        let mut cfg = config(root.path());
+        cfg.files.outbound = None;
+        cfg.rules.output.clear();
+        fs::write(path(&cfg, Direction::Inbound), "# intentionally empty\n").unwrap();
+
+        let mut daemon = Daemon::new(cfg, MemoryBackend::default()).unwrap();
+        daemon.initial_load().unwrap();
+
+        let inbound = daemon
+            .active
+            .as_ref()
+            .and_then(|active| active.inbound.as_ref())
+            .unwrap();
+        assert_eq!(inbound.ipv4_intervals, 0);
+        assert_eq!(inbound.ipv6_intervals, 0);
+        assert!(daemon.backend.chunks.is_empty());
+    }
+
+    #[test]
     fn failed_activation_does_not_advance_active_generation() {
         let root = tempfile::tempdir().unwrap();
         let cfg = config(root.path());
-        fs::write(&cfg.files.inbound, "10.0.0.0/8\n").unwrap();
-        fs::write(&cfg.files.outbound, "2001:db8::/32\n").unwrap();
+        fs::write(path(&cfg, Direction::Inbound), "10.0.0.0/8\n").unwrap();
+        fs::write(path(&cfg, Direction::Outbound), "2001:db8::/32\n").unwrap();
         let mut daemon = Daemon::new(cfg, MemoryBackend::default()).unwrap();
         daemon.initial_load().unwrap();
         let old = daemon.active.clone();
-        fs::write(&daemon.config.files.inbound, "192.0.2.0/24\n").unwrap();
+        fs::write(path(&daemon.config, Direction::Inbound), "192.0.2.0/24\n").unwrap();
         daemon.backend.fail_next = true;
         assert!(daemon.reload(Direction::Inbound).is_err());
         assert_eq!(daemon.active, old);
@@ -556,14 +651,14 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let mut cfg = config(root.path());
         cfg.nftables.populate_batch_elements = 2;
-        fs::write(&cfg.files.inbound, "10.0.0.0/32\n").unwrap();
-        fs::write(&cfg.files.outbound, "2001:db8::/128\n").unwrap();
+        fs::write(path(&cfg, Direction::Inbound), "10.0.0.0/32\n").unwrap();
+        fs::write(path(&cfg, Direction::Outbound), "2001:db8::/128\n").unwrap();
         let mut daemon = Daemon::new(cfg, MemoryBackend::default()).unwrap();
         daemon.initial_load().unwrap();
         let old = daemon.active.clone();
         let chunks_before = daemon.backend.chunks.len();
         fs::write(
-            &daemon.config.files.inbound,
+            path(&daemon.config, Direction::Inbound),
             "10.0.0.2/32\n10.0.0.4/32\nnot-a-cidr\n",
         )
         .unwrap();
@@ -577,8 +672,8 @@ mod tests {
     fn incompatible_layout_fails_without_bootstrapping() {
         let root = tempfile::tempdir().unwrap();
         let cfg = config(root.path());
-        fs::write(&cfg.files.inbound, "10.0.0.0/8\n").unwrap();
-        fs::write(&cfg.files.outbound, "2001:db8::/32\n").unwrap();
+        fs::write(path(&cfg, Direction::Inbound), "10.0.0.0/8\n").unwrap();
+        fs::write(path(&cfg, Direction::Outbound), "2001:db8::/32\n").unwrap();
         let backend = MemoryBackend {
             layout: Some(LayoutStatus::Incompatible),
             ..Default::default()
@@ -594,8 +689,8 @@ mod tests {
     fn healthy_reconciliation_refreshes_rules_without_repopulating_sets() {
         let root = tempfile::tempdir().unwrap();
         let cfg = config(root.path());
-        fs::write(&cfg.files.inbound, "10.0.0.0/8\n").unwrap();
-        fs::write(&cfg.files.outbound, "2001:db8::/32\n").unwrap();
+        fs::write(path(&cfg, Direction::Inbound), "10.0.0.0/8\n").unwrap();
+        fs::write(path(&cfg, Direction::Outbound), "2001:db8::/32\n").unwrap();
         let mut daemon = Daemon::new(cfg, MemoryBackend::default()).unwrap();
         daemon.initial_load().unwrap();
         let active = daemon.active.clone();
@@ -614,8 +709,8 @@ mod tests {
     fn damaged_inbound_reconciliation_repopulates_only_inbound_sets() {
         let root = tempfile::tempdir().unwrap();
         let cfg = config(root.path());
-        fs::write(&cfg.files.inbound, "10.0.0.0/8\n").unwrap();
-        fs::write(&cfg.files.outbound, "2001:db8::/32\n").unwrap();
+        fs::write(path(&cfg, Direction::Inbound), "10.0.0.0/8\n").unwrap();
+        fs::write(path(&cfg, Direction::Outbound), "2001:db8::/32\n").unwrap();
         let mut daemon = Daemon::new(cfg, MemoryBackend::default()).unwrap();
         daemon.initial_load().unwrap();
         let old = daemon.active.clone().unwrap();
@@ -635,8 +730,8 @@ mod tests {
     fn layout_damage_replaces_and_cleans_directions_sequentially() {
         let root = tempfile::tempdir().unwrap();
         let cfg = config(root.path());
-        fs::write(&cfg.files.inbound, "10.0.0.0/8\n").unwrap();
-        fs::write(&cfg.files.outbound, "2001:db8::/32\n").unwrap();
+        fs::write(path(&cfg, Direction::Inbound), "10.0.0.0/8\n").unwrap();
+        fs::write(path(&cfg, Direction::Outbound), "2001:db8::/32\n").unwrap();
         let mut daemon = Daemon::new(cfg, MemoryBackend::default()).unwrap();
         daemon.initial_load().unwrap();
         let old = daemon.active.clone().unwrap();
@@ -668,8 +763,8 @@ mod tests {
     fn immediate_health_failure_rejects_staged_generation() {
         let root = tempfile::tempdir().unwrap();
         let cfg = config(root.path());
-        fs::write(&cfg.files.inbound, "10.0.0.0/8\n").unwrap();
-        fs::write(&cfg.files.outbound, "2001:db8::/32\n").unwrap();
+        fs::write(path(&cfg, Direction::Inbound), "10.0.0.0/8\n").unwrap();
+        fs::write(path(&cfg, Direction::Outbound), "2001:db8::/32\n").unwrap();
         let mut daemon = Daemon::new(cfg, MemoryBackend::default()).unwrap();
         daemon.initial_load().unwrap();
         let old = daemon.active.clone();
@@ -685,8 +780,8 @@ mod tests {
     fn unhealthy_startup_returns_error_without_activating_generation() {
         let root = tempfile::tempdir().unwrap();
         let cfg = config(root.path());
-        fs::write(&cfg.files.inbound, "10.0.0.0/8\n").unwrap();
-        fs::write(&cfg.files.outbound, "2001:db8::/32\n").unwrap();
+        fs::write(path(&cfg, Direction::Inbound), "10.0.0.0/8\n").unwrap();
+        fs::write(path(&cfg, Direction::Outbound), "2001:db8::/32\n").unwrap();
         let backend = MemoryBackend {
             health: Some(Health::InboundDamaged),
             ..Default::default()
@@ -695,7 +790,7 @@ mod tests {
 
         let error = daemon.initial_load().unwrap_err().to_string();
 
-        assert!(error.contains("startup could not activate and verify both blocklists"));
+        assert!(error.contains("startup could not activate and verify configured blocklists"));
         assert!(daemon.active.is_none());
         assert!(daemon.backend.active.is_none());
     }

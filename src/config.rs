@@ -57,8 +57,10 @@ pub struct Config {
 pub struct Files {
     #[serde(default)]
     pub zones: Option<PathBuf>,
-    pub inbound: PathBuf,
-    pub outbound: PathBuf,
+    #[serde(default)]
+    pub inbound: Option<PathBuf>,
+    #[serde(default)]
+    pub outbound: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -133,10 +135,10 @@ impl Config {
             value.zones = None;
         }
         if let Some(v) = &cli.inbound {
-            value.files.inbound = v.clone();
+            value.files.inbound = Some(v.clone());
         }
         if let Some(v) = &cli.outbound {
-            value.files.outbound = v.clone();
+            value.files.outbound = Some(v.clone());
         }
         if let Some(v) = &cli.table {
             value.nftables.table = v.clone();
@@ -185,6 +187,15 @@ impl Config {
         {
             bail!("at least one rule mapping is required")
         }
+        for direction in [Direction::Inbound, Direction::Outbound] {
+            if self.uses(direction) && self.blocklist_path(direction).is_none() {
+                bail!(
+                    "[files].{} is required because a rule references the {} blocklist",
+                    direction.name(),
+                    direction.name()
+                )
+            }
+        }
         match (&self.files.zones, &self.zones) {
             (None, None) => bail!("zones must be defined in [zones] or [files].zones"),
             (Some(_), Some(_)) => {
@@ -197,6 +208,22 @@ impl Config {
 
     pub fn debounce(&self) -> Duration {
         Duration::from_millis(self.runtime.debounce_ms)
+    }
+
+    pub fn blocklist_path(&self, direction: Direction) -> Option<&Path> {
+        match direction {
+            Direction::Inbound => self.files.inbound.as_deref(),
+            Direction::Outbound => self.files.outbound.as_deref(),
+        }
+    }
+
+    pub fn uses(&self, direction: Direction) -> bool {
+        self.rules
+            .input
+            .iter()
+            .chain(&self.rules.forward)
+            .chain(&self.rules.output)
+            .any(|rule| rule.blocklist == direction)
     }
     pub fn reconcile(&self) -> Duration {
         Duration::from_secs(self.runtime.reconcile_secs)
@@ -214,6 +241,15 @@ impl Config {
             (Some(_), Some(_)) => {
                 bail!("zones must be defined in only one of [zones] or [files].zones")
             }
+        }
+    }
+}
+
+impl Direction {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Inbound => "inbound",
+            Self::Outbound => "outbound",
         }
     }
 }
@@ -249,6 +285,25 @@ ingress_zones = ["WAN"]
 
         let rules = config.resolve_rules(&config.load_zones().unwrap()).unwrap();
         assert_eq!(rules[0].ingress, ["eth0"]);
+    }
+
+    #[test]
+    fn accepts_an_omitted_unused_blocklist() {
+        let text = INLINE_CONFIG.replace("outbound = \"/data/outbound.txt\"\n", "");
+        let config: Config = toml::from_str(&text).unwrap();
+
+        config.validate().unwrap();
+        assert!(config.blocklist_path(Direction::Inbound).is_some());
+        assert!(config.blocklist_path(Direction::Outbound).is_none());
+    }
+
+    #[test]
+    fn rejects_an_omitted_referenced_blocklist() {
+        let text = INLINE_CONFIG.replace("inbound = \"/data/inbound.txt\"\n", "");
+        let config: Config = toml::from_str(&text).unwrap();
+
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("[files].inbound is required"));
     }
 
     #[test]

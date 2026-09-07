@@ -23,10 +23,30 @@ pub struct DirectionGeneration {
     pub ipv6_boundaries: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ActiveGenerations {
-    pub inbound: DirectionGeneration,
-    pub outbound: DirectionGeneration,
+    pub inbound: Option<DirectionGeneration>,
+    pub outbound: Option<DirectionGeneration>,
+}
+
+impl ActiveGenerations {
+    pub fn get(&self, direction: Direction) -> Option<&DirectionGeneration> {
+        match direction {
+            Direction::Inbound => self.inbound.as_ref(),
+            Direction::Outbound => self.outbound.as_ref(),
+        }
+    }
+
+    pub fn set(&mut self, direction: Direction, generation: DirectionGeneration) {
+        match direction {
+            Direction::Inbound => self.inbound = Some(generation),
+            Direction::Outbound => self.outbound = Some(generation),
+        }
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &DirectionGeneration> {
+        self.inbound.iter().chain(&self.outbound)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -379,14 +399,10 @@ mod native {
             config: &Config,
             active: &ActiveGenerations,
         ) -> Result<(), BackendError> {
-            let keep: BTreeSet<&str> = [
-                active.inbound.ipv4_set.as_str(),
-                active.inbound.ipv6_set.as_str(),
-                active.outbound.ipv4_set.as_str(),
-                active.outbound.ipv6_set.as_str(),
-            ]
-            .into_iter()
-            .collect();
+            let keep: BTreeSet<&str> = active
+                .iter()
+                .flat_map(|generation| [generation.ipv4_set.as_str(), generation.ipv6_set.as_str()])
+                .collect();
             let sets = set_inventory(&config.nftables.table)?;
             let obsolete: Vec<String> = sets
                 .keys()
@@ -432,13 +448,16 @@ mod native {
                     (false, true)
                 }
             };
-            let inspect_direction = |value: &DirectionGeneration| {
+            let inspect_direction = |value: Option<&DirectionGeneration>| {
+                let Some(value) = value else {
+                    return (false, false);
+                };
                 let ipv4 = inspect(&value.ipv4_set, value.ipv4_intervals);
                 let ipv6 = inspect(&value.ipv6_set, value.ipv6_intervals);
                 (ipv4.0 || ipv6.0, ipv4.1 || ipv6.1)
             };
-            let inbound = inspect_direction(&active.inbound);
-            let outbound = inspect_direction(&active.outbound);
+            let inbound = inspect_direction(active.inbound.as_ref());
+            let outbound = inspect_direction(active.outbound.as_ref());
             if (inbound.1 || outbound.1) && !self.warned_missing_counts {
                 log::warn!(
                     "kernel does not report nftables set element counts; reconciliation will verify set presence but cannot detect element-count mismatches"
@@ -617,10 +636,14 @@ mod native {
             batch.add(&RuleFlush::new(chain), MsgType::Del);
         }
         add_base_rules(&mut batch, &input, &forward, &output, rules).map_err(io::Error::other)?;
-        add_dispatch_rules(&mut batch, &inbound, &active.inbound, Direction::Inbound)
-            .map_err(io::Error::other)?;
-        add_dispatch_rules(&mut batch, &outbound, &active.outbound, Direction::Outbound)
-            .map_err(io::Error::other)?;
+        if let Some(generation) = &active.inbound {
+            add_dispatch_rules(&mut batch, &inbound, generation, Direction::Inbound)
+                .map_err(io::Error::other)?;
+        }
+        if let Some(generation) = &active.outbound {
+            add_dispatch_rules(&mut batch, &outbound, generation, Direction::Outbound)
+                .map_err(io::Error::other)?;
+        }
         send_and_process(&batch.finalize())
     }
 
@@ -975,10 +998,7 @@ pub mod test_backend {
                 return Err(std::io::Error::other("injected activation error").into());
             }
             let active = self.active.as_mut().unwrap();
-            match direction {
-                Direction::Inbound => active.inbound = generation.clone(),
-                Direction::Outbound => active.outbound = generation.clone(),
-            }
+            active.set(direction, generation.clone());
             self.activations.push(direction);
             Ok(())
         }
