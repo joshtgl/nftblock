@@ -16,6 +16,8 @@ fn main() -> anyhow::Result<()> {
         .manifest_path
         .parent()
         .ok_or_else(|| anyhow!("cidrwall-ebpf manifest has no parent"))?;
+    std::env::set_current_dir(root_dir)
+        .with_context(|| format!("enter cidrwall-ebpf source directory {root_dir}"))?;
     aya_build::build_ebpf(
         [aya_build::Package {
             name: package.name.as_str(),
