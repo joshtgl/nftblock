@@ -11,24 +11,29 @@ VPN1 = ["wg0"]
 VPN2 = ["wg1"]
 
 [nftables]
-table = "nftblock"
+table = "cidrwall"
 priority = -5
 batch_page_bytes = 131072
 populate_batch_elements = 2000
 allow_flowtable_bypass = false
+cleanup_on_exit = false
+
+[xdp]
+mode = "auto"
+pin_path = "/sys/fs/bpf/cidrwall"
+ipv4_max_entries = 5000000
+ipv6_max_entries = 5000000
+populate_batch_elements = 2000
+allow_nftables_overlap = false
+cleanup_on_exit = false
 
 [runtime]
 debounce_ms = 500
 reconcile_secs = 60
 
-[[rules.input]]
+[[xdp.rules]]
 blocklist = "inbound"
 ingress_zones = ["WAN"]
-
-[[rules.forward]]
-blocklist = "inbound"
-ingress_zones = ["WAN"]
-egress_zones = ["LAN", "GUEST"]
 
 [[rules.output]]
 blocklist = "outbound"

@@ -27,6 +27,78 @@ impl AddressInterval {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddressPrefix {
+    V4 { address: Ipv4Addr, prefix_len: u8 },
+    V6 { address: Ipv6Addr, prefix_len: u8 },
+}
+
+/// Decompose an inclusive address interval into the smallest set of CIDR prefixes.
+pub fn interval_prefixes(interval: AddressInterval) -> Vec<AddressPrefix> {
+    match interval {
+        AddressInterval::V4 { first, after_last } => {
+            let mut start = u32::from(first);
+            let end = after_last.map_or(u32::MAX, |value| u32::from(value) - 1);
+            let mut out = Vec::new();
+            loop {
+                let alignment = if start == 0 {
+                    32
+                } else {
+                    start.trailing_zeros()
+                };
+                let remaining = u64::from(end) - u64::from(start) + 1;
+                let fit = 63 - remaining.leading_zeros();
+                let host_bits = alignment.min(fit);
+                out.push(AddressPrefix::V4 {
+                    address: Ipv4Addr::from(start),
+                    prefix_len: (32 - host_bits) as u8,
+                });
+                let size = 1u64 << host_bits;
+                let next = u64::from(start) + size;
+                if next > u64::from(end) {
+                    break;
+                }
+                start = next as u32;
+            }
+            out
+        }
+        AddressInterval::V6 { first, after_last } => {
+            let mut start = u128::from(first);
+            let end = after_last.map_or(u128::MAX, |value| u128::from(value) - 1);
+            let mut out = Vec::new();
+            loop {
+                if start == 0 && end == u128::MAX {
+                    out.push(AddressPrefix::V6 {
+                        address: Ipv6Addr::UNSPECIFIED,
+                        prefix_len: 0,
+                    });
+                    break;
+                }
+                let alignment = if start == 0 {
+                    128
+                } else {
+                    start.trailing_zeros()
+                };
+                let remaining = end - start + 1;
+                let fit = 127 - remaining.leading_zeros();
+                let host_bits = alignment.min(fit);
+                out.push(AddressPrefix::V6 {
+                    address: Ipv6Addr::from(start),
+                    prefix_len: (128 - host_bits) as u8,
+                });
+                let Some(next) = start.checked_add(1u128 << host_bits) else {
+                    break;
+                };
+                if next > end {
+                    break;
+                }
+                start = next;
+            }
+            out
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct StreamStats {
     pub cidrs: u64,
@@ -331,5 +403,29 @@ mod tests {
         assert_eq!(stats.ipv4_intervals, 1);
         assert_eq!(stats.ipv4_boundaries, 1);
         assert_eq!(chunks[0][0].boundary_elements(), 1);
+    }
+
+    #[test]
+    fn decomposes_intervals_into_minimal_prefixes() {
+        assert_eq!(
+            interval_prefixes(AddressInterval::V4 {
+                first: "10.0.0.0".parse().unwrap(),
+                after_last: Some("10.0.1.0".parse().unwrap()),
+            }),
+            [AddressPrefix::V4 {
+                address: "10.0.0.0".parse().unwrap(),
+                prefix_len: 24
+            }]
+        );
+        assert_eq!(
+            interval_prefixes(AddressInterval::V6 {
+                first: Ipv6Addr::UNSPECIFIED,
+                after_last: None,
+            }),
+            [AddressPrefix::V6 {
+                address: Ipv6Addr::UNSPECIFIED,
+                prefix_len: 0
+            }]
+        );
     }
 }

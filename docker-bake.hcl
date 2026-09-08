@@ -14,11 +14,11 @@ target "common" {
 target "debian" {
   inherits   = ["common"]
   dockerfile = "Dockerfile.debian"
-  tags       = ["nftblock:debian"]
+  tags       = ["cidrwall:debian"]
 }
 
 target "alpine" {
   inherits   = ["common"]
   dockerfile = "Dockerfile.alpine"
-  tags       = ["nftblock:alpine"]
+  tags       = ["cidrwall:alpine"]
 }

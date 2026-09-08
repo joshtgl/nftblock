@@ -2,22 +2,30 @@
 
 FROM rust:1-alpine3.24 AS builder
 
-RUN apk add --no-cache build-base libmnl-dev libnftnl-dev pkgconf
+RUN apk add --no-cache build-base curl libmnl-dev libnftnl-dev pkgconf zstd \
+    && rustup toolchain install nightly --profile minimal --component rust-src \
+    && curl -fsSL https://github.com/aya-rs/bpf-linker/releases/download/v0.11.0/bpf-linker-x86_64-unknown-linux-musl.tar.zst -o /tmp/bpf-linker.tar.zst \
+    && echo "10f62ba9ab7e544d538370552660efcb4f1a19153d5752bbf0f6b51f3bada450  /tmp/bpf-linker.tar.zst" | sha256sum -c - \
+    && zstd -d /tmp/bpf-linker.tar.zst -o /tmp/bpf-linker.tar \
+    && tar -xpf /tmp/bpf-linker.tar -C /usr/local/bin
 
 WORKDIR /src
 
 COPY Cargo.toml Cargo.lock ./
+COPY build.rs ./
+COPY cidrwall-common ./cidrwall-common
+COPY cidrwall-ebpf ./cidrwall-ebpf
 COPY src ./src
 
 ENV RUSTFLAGS="-C target-feature=-crt-static"
 
-RUN cargo build --locked --release --bin nftblock
+RUN cargo build --locked --release --bin cidrwall
 
 FROM alpine:3.24.1
 
 RUN apk add --no-cache ca-certificates libgcc libmnl libnftnl
 
-COPY --from=builder /src/target/release/nftblock /usr/local/bin/nftblock
-COPY config/nftblock.toml /etc/nftblock/nftblock.toml
+COPY --from=builder /src/target/release/cidrwall /usr/local/bin/cidrwall
+COPY config/cidrwall.toml /etc/cidrwall/cidrwall.toml
 
-ENTRYPOINT ["nftblock"]
+ENTRYPOINT ["cidrwall"]

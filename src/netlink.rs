@@ -3,14 +3,17 @@ use crate::{
     config::{Config, Direction},
     rules::RenderedRule,
 };
-use std::collections::{BTreeMap, BTreeSet};
+#[cfg(feature = "native-netlink")]
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use thiserror::Error;
 
 #[cfg(feature = "native-netlink")]
 #[allow(unsafe_code)]
 mod ffi;
 
-const LAYOUT_MARKER: &str = "__nftblock_layout_v2";
+#[cfg(feature = "native-netlink")]
+const LAYOUT_MARKER: &str = "__cidrwall_layout_v2";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirectionGeneration {
@@ -74,9 +77,12 @@ pub enum BackendError {
     FlowtableBypass(BTreeSet<String>),
     #[error("invalid kernel object name: {0}")]
     InvalidName(String),
+    #[error("refusing to remove an incompatible cidrwall layout")]
+    IncompatibleLayout,
 }
 
 pub trait Backend {
+    fn cleanup(&mut self, config: &Config) -> Result<(), BackendError>;
     fn layout_status(&mut self, config: &Config) -> Result<LayoutStatus, BackendError>;
     fn bootstrap(&mut self, config: &Config, rules: &[RenderedRule]) -> Result<(), BackendError>;
     fn begin_stage(
@@ -149,6 +155,9 @@ impl NftnlBackend {
 
 #[cfg(not(feature = "native-netlink"))]
 impl Backend for NftnlBackend {
+    fn cleanup(&mut self, _: &Config) -> Result<(), BackendError> {
+        Err(BackendError::Disabled)
+    }
     fn layout_status(&mut self, _: &Config) -> Result<LayoutStatus, BackendError> {
         Err(BackendError::Disabled)
     }
@@ -251,6 +260,18 @@ mod native {
     }
 
     impl Backend for NftnlBackend {
+        fn cleanup(&mut self, config: &Config) -> Result<(), BackendError> {
+            match self.layout_status(config)? {
+                LayoutStatus::Absent => return Ok(()),
+                LayoutStatus::Incompatible => return Err(BackendError::IncompatibleLayout),
+                LayoutStatus::Current => {}
+            }
+            let table_name = cstring(&config.nftables.table)?;
+            let table = Table::new(&table_name, ProtoFamily::Inet);
+            let mut batch = Batch::with_page_size(config.nftables.batch_page_bytes);
+            batch.add(&table, MsgType::Del);
+            send_and_process(&batch.finalize()).map_err(Into::into)
+        }
         fn layout_status(&mut self, config: &Config) -> Result<LayoutStatus, BackendError> {
             let tables = table_names()?;
             if !tables.contains(&config.nftables.table) {
@@ -273,7 +294,7 @@ mod native {
             let table_name = cstring(&config.nftables.table)?;
             let table = Table::new(&table_name, ProtoFamily::Inet);
             let (input, forward, output, inbound, outbound) = make_chains(config, &table);
-            let marker = interval_set::<Ipv4Addr>(c"__nftblock_layout_v2", 90, &table);
+            let marker = interval_set::<Ipv4Addr>(c"__cidrwall_layout_v2", 90, &table);
             let mut batch = Batch::with_page_size(config.nftables.batch_page_bytes);
             batch.add(&table, MsgType::Add);
             add_chain_set(&mut batch, (&input, &forward, &output, &inbound, &outbound));
@@ -912,7 +933,7 @@ mod native {
                     .unwrap()
                     .parse::<u64>()
                     .unwrap();
-                eprintln!("nftblock scale-test peak RSS: {peak_kib} KiB");
+                eprintln!("cidrwall scale-test peak RSS: {peak_kib} KiB");
                 assert!(
                     peak_kib < BUDGET_KIB,
                     "peak RSS {peak_kib} KiB exceeded 256 MiB"
@@ -940,6 +961,11 @@ pub mod test_backend {
         pub cleanups: Vec<ActiveGenerations>,
     }
     impl Backend for MemoryBackend {
+        fn cleanup(&mut self, _: &Config) -> Result<(), BackendError> {
+            self.layout = None;
+            self.active = None;
+            Ok(())
+        }
         fn layout_status(&mut self, _: &Config) -> Result<LayoutStatus, BackendError> {
             Ok(self.layout.unwrap_or(LayoutStatus::Absent))
         }

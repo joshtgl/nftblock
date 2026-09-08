@@ -69,6 +69,9 @@ pub struct ResolvedRule {
 }
 
 impl Zones {
+    pub fn interfaces(&self, names: &[String]) -> Result<Vec<String>> {
+        self.expand(names, false)
+    }
     pub fn load(path: &Path) -> Result<Self> {
         let text =
             std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;

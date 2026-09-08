@@ -1,3 +1,5 @@
+#[cfg(feature = "xdp")]
+use crate::xdp::XdpManager;
 use crate::{
     blocklist,
     config::{Config, Direction, open_blocklist},
@@ -26,6 +28,11 @@ pub struct Daemon<B> {
     protected: BTreeSet<String>,
     active: Option<ActiveGenerations>,
     backend: B,
+    nft_started: bool,
+    #[cfg(feature = "xdp")]
+    xdp: Option<XdpManager>,
+    #[cfg(feature = "xdp")]
+    xdp_started: bool,
 }
 
 impl<B: Backend> Daemon<B> {
@@ -37,36 +44,89 @@ impl<B: Backend> Daemon<B> {
             .flat_map(|rule| rule.ingress.iter().chain(rule.egress.iter()))
             .cloned()
             .collect();
-        check_flowtables(&config, &mut backend, &protected)?;
+        if !rules.is_empty() {
+            check_flowtables(&config, &mut backend, &protected)?;
+        }
+        #[cfg(feature = "xdp")]
+        let xdp = if config.xdp.rules.is_empty() {
+            None
+        } else {
+            Some(XdpManager::new(
+                &config,
+                config.resolve_xdp_interfaces(&zones)?,
+            )?)
+        };
+        #[cfg(not(feature = "xdp"))]
+        if !config.xdp.rules.is_empty() {
+            bail!("XDP rules were configured, but this cidrwall build has no XDP support");
+        }
         Ok(Self {
             config,
             rules,
             protected,
             active: None,
             backend,
+            nft_started: false,
+            #[cfg(feature = "xdp")]
+            xdp,
+            #[cfg(feature = "xdp")]
+            xdp_started: false,
         })
     }
 
     pub fn start(mut self) -> Result<()> {
-        self.initial_load()?;
-        self.watch()
+        let result = self.initial_load().and_then(|()| self.watch());
+        let mut cleanup_errors = Vec::new();
+        #[cfg(feature = "xdp")]
+        if self.xdp_started
+            && self.config.xdp.cleanup_on_exit
+            && let Some(xdp) = self.xdp.take()
+            && let Err(error) = xdp.cleanup()
+        {
+            cleanup_errors.push(anyhow::anyhow!("XDP cleanup failed: {error:#}"));
+        }
+        if self.nft_started
+            && self.config.nftables.cleanup_on_exit
+            && let Err(error) = self.backend.cleanup(&self.config)
+        {
+            cleanup_errors.push(anyhow::anyhow!("nftables cleanup failed: {error}"));
+        }
+        match (result, cleanup_errors.is_empty()) {
+            (Ok(()), true) => Ok(()),
+            (Ok(()), false) => Err(cleanup_errors.remove(0)),
+            (Err(error), true) => Err(error),
+            (Err(error), false) => Err(error.context(format!(
+                "cleanup also failed: {:#}",
+                cleanup_errors.remove(0)
+            ))),
+        }
     }
 
     fn initial_load(&mut self) -> Result<()> {
-        log::info!(
-            "blocklist load triggered: reason=startup table=inet {}",
-            self.config.nftables.table
-        );
-        match self.backend.layout_status(&self.config)? {
-            LayoutStatus::Absent => self.backend.bootstrap(&self.config, &self.rules)?,
-            LayoutStatus::Current => {}
-            LayoutStatus::Incompatible => bail!(
-                "table inet {} uses an unsupported pre-generation layout; remove it before starting nftblock",
+        if !self.rules.is_empty() {
+            log::info!(
+                "blocklist load triggered: reason=startup table=inet {}",
                 self.config.nftables.table
-            ),
+            );
+            match self.backend.layout_status(&self.config)? {
+                LayoutStatus::Absent => self.backend.bootstrap(&self.config, &self.rules)?,
+                LayoutStatus::Current => {}
+                LayoutStatus::Incompatible => bail!(
+                    "table inet {} uses an unsupported pre-generation layout; remove it before starting cidrwall",
+                    self.config.nftables.table
+                ),
+            }
+            self.nft_started = true;
+            self.replace_both("startup")
+                .context("startup could not activate and verify configured blocklists")?;
         }
-        self.replace_both("startup")
-            .context("startup could not activate and verify configured blocklists")
+        #[cfg(feature = "xdp")]
+        if let Some(xdp) = &mut self.xdp {
+            self.xdp_started = true;
+            xdp.reload(&self.config, "startup")
+                .context("startup could not activate the XDP blocklist")?;
+        }
+        Ok(())
     }
 
     fn stage(&mut self, direction: Direction, reason: &str) -> Result<DirectionGeneration> {
@@ -125,12 +185,12 @@ impl<B: Backend> Daemon<B> {
     fn replace_both(&mut self, reason: &str) -> Result<()> {
         let directions: Vec<_> = [Direction::Inbound, Direction::Outbound]
             .into_iter()
-            .filter(|direction| self.config.uses(*direction))
+            .filter(|direction| self.config.uses_nftables(*direction))
             .collect();
         if self.active.is_some() {
             log::info!("sequential blocklist replacement triggered: reason={reason}");
             for direction in directions {
-                self.reload_for(direction, reason)?;
+                self.reload_nft_for(direction, reason)?;
             }
             let active = self
                 .active
@@ -238,11 +298,11 @@ impl<B: Backend> Daemon<B> {
     }
 
     pub fn reload(&mut self, direction: Direction) -> Result<()> {
-        self.reload_for(direction, "requested reload")
+        self.reload_backends(direction, "requested reload")
     }
 
-    fn reload_for(&mut self, direction: Direction, reason: &str) -> Result<()> {
-        if !self.config.uses(direction) {
+    fn reload_nft_for(&mut self, direction: Direction, reason: &str) -> Result<()> {
+        if !self.config.uses_nftables(direction) {
             bail!(
                 "{} blocklist is not configured or referenced",
                 direction.name()
@@ -374,7 +434,7 @@ impl<B: Backend> Daemon<B> {
                 .collect();
             for direction in due {
                 pending.remove(&direction);
-                if let Err(error) = self.reload_for(direction, "filesystem change") {
+                if let Err(error) = self.reload_backends(direction, "filesystem change") {
                     log::error!(
                         "{:?} replacement rejected; active sets retained: {error:#}",
                         direction
@@ -386,7 +446,6 @@ impl<B: Backend> Daemon<B> {
                     "reconciliation triggered: reason=periodic interval_secs={}",
                     self.config.runtime.reconcile_secs
                 );
-                check_flowtables(&self.config, &mut self.backend, &self.protected)?;
                 if let Err(error) = self.reconcile() {
                     log::error!(
                         "table reconciliation failed; current generation retained: {error:#}"
@@ -395,14 +454,59 @@ impl<B: Backend> Daemon<B> {
                 next_reconcile = now + self.config.reconcile();
             }
         }
-        log::info!(
-            "shutdown requested; preserving table inet {}",
-            self.config.nftables.table
-        );
+        log::info!("shutdown requested; preserving configured kernel state");
         Ok(())
     }
 
     fn reconcile(&mut self) -> Result<()> {
+        let mut errors = Vec::new();
+        if !self.rules.is_empty()
+            && let Err(error) = check_flowtables(&self.config, &mut self.backend, &self.protected)
+                .and_then(|()| self.reconcile_nft())
+        {
+            errors.push(error);
+        }
+        #[cfg(feature = "xdp")]
+        if let Some(xdp) = &mut self.xdp
+            && let Err(error) = xdp.reconcile()
+        {
+            errors.push(error.context("XDP reconciliation failed"));
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.remove(0))
+        }
+    }
+
+    fn reload_backends(&mut self, direction: Direction, reason: &str) -> Result<()> {
+        if !self.config.uses(direction) {
+            bail!(
+                "{} blocklist is not configured or referenced",
+                direction.name()
+            );
+        }
+        let mut errors = Vec::new();
+        if self.config.uses_nftables(direction)
+            && let Err(error) = self.reload_nft_for(direction, reason)
+        {
+            errors.push(error);
+        }
+        #[cfg(feature = "xdp")]
+        if direction == Direction::Inbound
+            && let Some(xdp) = &mut self.xdp
+            && let Err(error) = xdp.reload(&self.config, reason)
+        {
+            errors.push(error);
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.remove(0))
+        }
+    }
+
+    fn reconcile_nft(&mut self) -> Result<()> {
         let Some(active) = self.active.clone() else {
             log::warn!("reconciliation found no active generation; repopulating both blocklists");
             return self.replace_both("periodic reconciliation found no active generation");
@@ -431,11 +535,11 @@ impl<B: Backend> Daemon<B> {
                     "reconciliation complete: generation sets healthy; rules_refreshed=true sets_repopulated=false active={active:?}"
                 );
             }
-            Health::InboundDamaged => self.reload_for(
+            Health::InboundDamaged => self.reload_nft_for(
                 Direction::Inbound,
                 "periodic reconciliation found inbound set damage",
             )?,
-            Health::OutboundDamaged => self.reload_for(
+            Health::OutboundDamaged => self.reload_nft_for(
                 Direction::Outbound,
                 "periodic reconciliation found outbound set damage",
             )?,
@@ -501,7 +605,7 @@ fn same_target(event_path: &Path, target: &Path) -> bool {
 mod tests {
     use super::*;
     use crate::{
-        config::{Files, Nftables, RuleMapping, Rules, Runtime},
+        config::{Files, Nftables, RuleMapping, Rules, Runtime, Xdp},
         netlink::test_backend::MemoryBackend,
     };
     use notify::{
@@ -520,6 +624,7 @@ mod tests {
             },
             zones: None,
             nftables: Nftables::default(),
+            xdp: Xdp::default(),
             runtime: Runtime::default(),
             rules: Rules {
                 input: vec![RuleMapping {
@@ -598,7 +703,7 @@ mod tests {
         cfg.files.outbound = None;
         cfg.rules.output.clear();
         fs::write(path(&cfg, Direction::Inbound), "10.0.0.0/8\n").unwrap();
-        cfg.validate().unwrap();
+        cfg.validate(false).unwrap();
 
         let mut daemon = Daemon::new(cfg, MemoryBackend::default()).unwrap();
         daemon.initial_load().unwrap();

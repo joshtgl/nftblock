@@ -2,3 +2,22 @@
 git_tag_name = "v{{ version }}"
 git_release_name = "v{{ version }}"
 release_always = false
+
+[[package]]
+name = "cidrwall"
+version_group = "cidrwall"
+
+[[package]]
+name = "cidrwall-common"
+version_group = "cidrwall"
+changelog_update = false
+git_tag_enable = false
+git_release_enable = false
+
+[[package]]
+name = "cidrwall-ebpf"
+version_group = "cidrwall"
+changelog_update = false
+git_tag_enable = false
+git_release_enable = false
+semver_check = false
