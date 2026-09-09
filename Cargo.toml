@@ -21,14 +21,14 @@ xdp = ["dep:aya", "dep:cidrwall-common", "dep:cidrwall-ebpf"]
 anyhow = "1.0.104"
 clap = { version = "4.6.6", features = ["derive", "env"] }
 env_logger = "0.11.11"
-ipnet = { version = "2.12.1", features = ["serde"] }
-log = "0.4.33"
+ipnet = { version = "2.12.2", features = ["serde"] }
+log = "0.4.34"
 notify = "8.2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 signal-hook = "0.4.4"
 thiserror = "2.0.20"
-toml = "1.1.4"
+toml = "1.1.5"
 nftnl = { version = "0.9.4", optional = true, features = ["nftnl-1-1-6"] }
 mnl = { version = "0.3.1", optional = true }
 aya = { version = "0.14.0", optional = true }
@@ -37,7 +37,7 @@ cidrwall-common = { version = "=0.1.3", path = "cidrwall-common", optional = tru
 [build-dependencies]
 anyhow = "1.0.104"
 aya-build = "0.2.0"
-cargo_metadata = "0.23.0"
+cargo_metadata = "0.23.1"
 cidrwall-ebpf = { version = "=0.1.3", path = "cidrwall-ebpf", optional = true }
 
 [dev-dependencies]
